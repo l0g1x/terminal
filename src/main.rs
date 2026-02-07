@@ -17,7 +17,7 @@ use ftui_core::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, Mo
 use ftui_core::geometry::Rect;
 use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme};
 use ftui_layout::{Constraint, Flex};
-use ftui_render::cell::PackedRgba;
+use ftui_render::cell::{Cell as RenderCell, PackedRgba};
 use ftui_render::frame::{Frame, HitId, HitRegion};
 use ftui_runtime::program::{Cmd, Model, Program, ProgramConfig};
 use ftui_style::Style;
@@ -712,9 +712,10 @@ impl Model for FileBrowser {
         let ph = inner_preview_area.height;
         self.preview_height.set(ph);
 
-        // Clone preview_text for Paragraph -- this is the remaining unavoidable
-        // clone since Paragraph::new() consumes the Text. The Text struct itself
-        // is relatively cheap (Vec of Lines/Spans with small string data).
+        // Clear the preview area before rendering to prevent stale content
+        // from the previous file bleeding through when switching to shorter text.
+        frame.buffer.fill(inner_preview_area, RenderCell::default());
+
         let preview_paragraph = Paragraph::new(self.preview_text.clone())
             .style(self.styles.file_style)
             .wrap(WrapMode::Word)
