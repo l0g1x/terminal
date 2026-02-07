@@ -6,11 +6,15 @@ A terminal file browser built with [FrankenTUI](https://github.com/Dicklesworths
 
 ## Install
 
+Works on **Linux** and **macOS** (Intel & Apple Silicon). Builds from source.
+
 ```bash
 curl -sSf https://raw.githubusercontent.com/l0g1x/terminal/main/install.sh | bash
 ```
 
-That's it. Installs Rust if needed, builds from source, and puts `terminal` on your PATH.
+That's it. Installs Rust nightly if needed, builds from source, and puts `terminal` on your PATH.
+
+Pre-built binaries are also available on the [releases page](https://github.com/l0g1x/terminal/releases) (Linux x86_64).
 
 ## Usage
 
