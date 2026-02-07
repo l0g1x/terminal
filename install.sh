@@ -137,11 +137,32 @@ mkdir -p "$INSTALL_DIR"
 cp "$WORKDIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 chmod +x "$INSTALL_DIR/$BIN_NAME"
 
-# Verify
-if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
-    ok "Installed! Run it with: terminal"
+# Ensure INSTALL_DIR is in PATH (persist to shell profile if needed)
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+    EXPORT_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
+
+    # Find the right shell profile to update
+    SHELL_PROFILE=""
+    case "$(basename "${SHELL:-/bin/bash}")" in
+        zsh)  SHELL_PROFILE="$HOME/.zshrc" ;;
+        fish) ;;  # fish uses a different mechanism; skip
+        *)    SHELL_PROFILE="$HOME/.bashrc" ;;
+    esac
+
+    # Append if not already present
+    if [ -n "$SHELL_PROFILE" ] && [ -f "$SHELL_PROFILE" ]; then
+        if ! grep -qF "$INSTALL_DIR" "$SHELL_PROFILE" 2>/dev/null; then
+            printf '\n# Added by terminal installer\n%s\n' "$EXPORT_LINE" >> "$SHELL_PROFILE"
+            info "Added $INSTALL_DIR to PATH in $SHELL_PROFILE"
+        fi
+    elif [ -n "$SHELL_PROFILE" ]; then
+        printf '# Added by terminal installer\n%s\n' "$EXPORT_LINE" > "$SHELL_PROFILE"
+        info "Created $SHELL_PROFILE with PATH entry"
+    fi
+
+    # Also export for the current invocation context
+    export PATH="$INSTALL_DIR:$PATH"
+    ok "Installed! Open a new shell or run:  source $SHELL_PROFILE"
 else
-    ok "Installed to $INSTALL_DIR/$BIN_NAME"
-    info "Add to PATH if not already present:"
-    info "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    ok "Installed! Run it with:  terminal"
 fi
