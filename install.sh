@@ -7,12 +7,12 @@ set -euo pipefail
 # 1. Detects your OS and architecture
 # 2. Downloads a pre-built binary from the latest GitHub release
 # 3. Falls back to building from source if no binary is available
+# 4. Installs to /usr/local/bin (or ~/.local/bin if no root access)
 
 REPO_OWNER="l0g1x"
 REPO_NAME="terminal"
 REPO_URL="https://github.com/$REPO_OWNER/$REPO_NAME"
 BIN_NAME="terminal"
-INSTALL_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
 
 info()  { printf '\033[1;34m>>>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m>>>\033[0m %s\n' "$*"; }
@@ -26,6 +26,27 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Pick install directory: /usr/local/bin if writable, else ~/.local/bin
+# ---------------------------------------------------------------------------
+
+pick_install_dir() {
+    if [ -w /usr/local/bin ]; then
+        echo "/usr/local/bin"
+    elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+        # sudo available without password prompt (e.g. NOPASSWD or cached)
+        echo "/usr/local/bin"
+    else
+        echo "$HOME/.local/bin"
+    fi
+}
+
+INSTALL_DIR="$(pick_install_dir)"
+USE_SUDO=false
+if [ "$INSTALL_DIR" = "/usr/local/bin" ] && [ ! -w /usr/local/bin ]; then
+    USE_SUDO=true
+fi
 
 # ---------------------------------------------------------------------------
 # Detect platform
@@ -134,35 +155,22 @@ fi
 
 # Install
 mkdir -p "$INSTALL_DIR"
-cp "$WORKDIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
-chmod +x "$INSTALL_DIR/$BIN_NAME"
-
-# Ensure INSTALL_DIR is in PATH (persist to shell profile if needed)
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
-    EXPORT_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
-
-    # Find the right shell profile to update
-    SHELL_PROFILE=""
-    case "$(basename "${SHELL:-/bin/bash}")" in
-        zsh)  SHELL_PROFILE="$HOME/.zshrc" ;;
-        fish) ;;  # fish uses a different mechanism; skip
-        *)    SHELL_PROFILE="$HOME/.bashrc" ;;
-    esac
-
-    # Append if not already present
-    if [ -n "$SHELL_PROFILE" ] && [ -f "$SHELL_PROFILE" ]; then
-        if ! grep -qF "$INSTALL_DIR" "$SHELL_PROFILE" 2>/dev/null; then
-            printf '\n# Added by terminal installer\n%s\n' "$EXPORT_LINE" >> "$SHELL_PROFILE"
-            info "Added $INSTALL_DIR to PATH in $SHELL_PROFILE"
-        fi
-    elif [ -n "$SHELL_PROFILE" ]; then
-        printf '# Added by terminal installer\n%s\n' "$EXPORT_LINE" > "$SHELL_PROFILE"
-        info "Created $SHELL_PROFILE with PATH entry"
-    fi
-
-    # Also export for the current invocation context
-    export PATH="$INSTALL_DIR:$PATH"
-    ok "Installed! Open a new shell or run:  source $SHELL_PROFILE"
+if [ "$USE_SUDO" = true ]; then
+    info "Installing to $INSTALL_DIR (requires sudo)..."
+    sudo cp "$WORKDIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+    sudo chmod +x "$INSTALL_DIR/$BIN_NAME"
 else
-    ok "Installed! Run it with:  terminal"
+    cp "$WORKDIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+    chmod +x "$INSTALL_DIR/$BIN_NAME"
+fi
+
+ok "Installed to $INSTALL_DIR/$BIN_NAME"
+
+# Verify it's reachable
+if command -v "$BIN_NAME" &>/dev/null; then
+    ok "Ready! Run it with:  terminal"
+else
+    # ~/.local/bin might not be in PATH on older systems
+    warn "$INSTALL_DIR is not in your PATH."
+    info "Add it by running:  export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
