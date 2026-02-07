@@ -19,7 +19,8 @@ use ftui_core::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, Mo
 use ftui_core::geometry::Rect;
 use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme};
 use ftui_layout::{Constraint, Flex};
-use ftui_render::cell::{Cell as RenderCell, CellContent, PackedRgba, StyleFlags};
+use ftui_render::cell::{Cell as RenderCell, CellAttrs, PackedRgba, StyleFlags};
+use ftui_render::drawing::Draw;
 use ftui_render::frame::{Frame, HitId, HitRegion};
 use ftui_runtime::program::{Cmd, Model, Program, ProgramConfig};
 use ftui_style::Style;
@@ -929,6 +930,9 @@ fn flatten_walk<'a>(
 
 impl FileBrowser {
     /// Render the tree manually with viewport scrolling and selection highlight.
+    ///
+    /// Uses `Buffer::print_text_clipped` (via the `Draw` trait) for correct
+    /// wide-character handling, overlap cleanup, and dirty tracking.
     fn render_tree_with_selection(&self, area: Rect, frame: &mut Frame) {
         if area.is_empty() || self.visible_count == 0 {
             return;
@@ -944,18 +948,18 @@ impl FileBrowser {
         let scroll = self.tree_scroll;
         let end = (scroll + viewport_h).min(flat.len());
 
-        let guide_style = Style::new().fg(COLOR_BORDER);
         let selected = self.selected_index.min(self.visible_count.saturating_sub(1));
 
         for (row_idx, flat_idx) in (scroll..end).enumerate() {
             let node = &flat[flat_idx];
             let y = area.y + row_idx as u16;
-            let mut x = area.x;
             let max_x = area.right();
+            let mut x = area.x;
 
             let is_selected = flat_idx == selected;
 
-            // Determine styles for this row.
+            // Determine colors for this row.
+            let guide_fg = if is_selected { COLOR_SELECTED } else { COLOR_BORDER };
             let label_fg = if is_selected {
                 COLOR_SELECTED
             } else if node.is_dir {
@@ -964,7 +968,10 @@ impl FileBrowser {
                 COLOR_FILE
             };
 
-            // Draw guide characters for each depth level.
+            // Build a base cell for guide characters.
+            let guide_cell = RenderCell::from_char(' ').with_fg(guide_fg);
+
+            // Draw guide characters for each depth level using print_text_clipped.
             for d in 0..node.depth {
                 if x + 4 > max_x {
                     break;
@@ -985,36 +992,22 @@ impl FileBrowser {
                     }
                 };
 
-                let gfg = if is_selected { COLOR_SELECTED } else { guide_style.fg.unwrap_or(COLOR_BORDER) };
-
-                for ch in guide_str.chars() {
-                    if x >= max_x {
-                        break;
-                    }
-                    if let Some(cell) = frame.buffer.get_mut(x, y) {
-                        cell.fg = gfg;
-                        cell.content = CellContent::from_char(ch);
-                    }
-                    x += 1;
-                }
+                x = frame.buffer.print_text_clipped(x, y, guide_str, guide_cell, max_x);
             }
 
-            // Draw the label.
+            // Build a base cell for the label.
             let bold = is_selected || (node.depth == 0 && node.is_dir);
-            for ch in node.label.chars() {
-                if x >= max_x {
-                    break;
-                }
-                if let Some(cell) = frame.buffer.get_mut(x, y) {
-                    cell.fg = label_fg;
-                    cell.content = CellContent::from_char(ch);
-                    if bold {
-                        let flags = cell.attrs.flags() | StyleFlags::BOLD;
-                        cell.attrs = cell.attrs.with_flags(flags);
-                    }
-                }
-                x += 1;
-            }
+            let label_attrs = if bold {
+                CellAttrs::new(StyleFlags::BOLD, 0)
+            } else {
+                CellAttrs::NONE
+            };
+            let label_cell = RenderCell::from_char(' ')
+                .with_fg(label_fg)
+                .with_attrs(label_attrs);
+
+            // Draw the label using print_text_clipped.
+            frame.buffer.print_text_clipped(x, y, node.label, label_cell, max_x);
         }
     }
 }
@@ -1026,6 +1019,537 @@ impl FileBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftui_render::grapheme_pool::GraphemePool;
+
+    // -----------------------------------------------------------------------
+    // Helper: extract a row from a Frame as a trimmed String.
+    // -----------------------------------------------------------------------
+    fn row_text(frame: &Frame, y: u16, width: u16) -> String {
+        let mut out = String::new();
+        for x in 0..width {
+            if let Some(cell) = frame.buffer.get(x, y) {
+                if let Some(ch) = cell.content.as_char() {
+                    out.push(ch);
+                } else if cell.content.is_empty() {
+                    out.push(' ');
+                }
+                // skip continuations
+            }
+        }
+        out.trim_end().to_string()
+    }
+
+    /// Helper: extract the fg color at (x, y).
+    fn fg_at(frame: &Frame, x: u16, y: u16) -> PackedRgba {
+        frame.buffer.get(x, y).map_or(PackedRgba::TRANSPARENT, |c| c.fg)
+    }
+
+    /// Find the column index of the first occurrence of `needle` in a row string.
+    /// This accounts for multi-byte UTF-8 characters where byte offset != column.
+    fn find_col(row: &str, needle: char) -> Option<usize> {
+        row.chars().position(|c| c == needle)
+    }
+
+    /// Helper: check if the cell at (x, y) has the BOLD flag.
+    fn is_bold_at(frame: &Frame, x: u16, y: u16) -> bool {
+        frame
+            .buffer
+            .get(x, y)
+            .map_or(false, |c| c.attrs.has_flag(StyleFlags::BOLD))
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: create a FileBrowser with a synthetic in-memory tree.
+    // -----------------------------------------------------------------------
+    fn make_test_browser(nodes: Vec<TreeNode>, selected: usize, scroll: usize) -> FileBrowser {
+        let root_node = nodes.into_iter().fold(
+            TreeNode::new("root/").with_expanded(true),
+            |root, child| root.child(child),
+        );
+        let visible = root_node.visible_count();
+        let tree = Tree::new(root_node)
+            .with_show_root(true)
+            .with_guides(TreeGuides::Rounded)
+            .with_guide_style(Style::new().fg(COLOR_BORDER))
+            .with_label_style(Style::new().fg(COLOR_FILE))
+            .with_root_style(Style::new().fg(COLOR_DIR).bold())
+            .hit_id(TREE_HIT_ID);
+
+        FileBrowser {
+            root: PathBuf::from("/test"),
+            tree,
+            selected_index: selected,
+            visible_count: visible,
+            selected_file: None,
+            cached_path: None,
+            cached_path_index: usize::MAX,
+            preview_text: Text::raw(""),
+            is_markdown: false,
+            preview_scroll: 0,
+            preview_height: Cell::new(0),
+            focus: Pane::Tree,
+            status: String::new(),
+            preview_title: String::new(),
+            md_renderer: MarkdownRenderer::new(MarkdownTheme::default()),
+            scrollbar_state: ScrollbarState::new(0, 0, 0),
+            styles: CachedStyles::new(),
+            path_scratch: Vec::new(),
+            update_notice: None,
+            tree_scroll: scroll,
+            tree_height: Cell::new(0),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: render the tree into a Frame and return it for assertions.
+    // -----------------------------------------------------------------------
+    /// Render the tree and return each row as a String.
+    fn render_tree_rows(browser: &FileBrowser, width: u16, height: u16) -> Vec<String> {
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(width, height, &mut pool);
+        let area = Rect::new(0, 0, width, height);
+
+        // Set tree_height so update_tree_scroll works.
+        browser.tree_height.set(height);
+
+        browser.render_tree_with_selection(area, &mut frame);
+
+        (0..height).map(|y| row_text(&frame, y, width)).collect()
+    }
+
+    /// Render the tree and return (rows, fg_colors_per_row, bold_flags_per_row).
+    fn render_tree_detailed(
+        browser: &FileBrowser,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, Vec<Vec<PackedRgba>>, Vec<Vec<bool>>) {
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(width, height, &mut pool);
+        let area = Rect::new(0, 0, width, height);
+        browser.tree_height.set(height);
+        browser.render_tree_with_selection(area, &mut frame);
+
+        let rows: Vec<String> = (0..height).map(|y| row_text(&frame, y, width)).collect();
+        let fgs: Vec<Vec<PackedRgba>> = (0..height)
+            .map(|y| (0..width).map(|x| fg_at(&frame, x, y)).collect())
+            .collect();
+        let bolds: Vec<Vec<bool>> = (0..height)
+            .map(|y| (0..width).map(|x| is_bold_at(&frame, x, y)).collect())
+            .collect();
+
+        (rows, fgs, bolds)
+    }
+
+    // =======================================================================
+    // INTEGRATION TESTS: Tree Rendering
+    // =======================================================================
+
+    #[test]
+    fn render_basic_tree_root_only() {
+        // A tree with just the root node, no children.
+        let browser = make_test_browser(vec![], 0, 0);
+        let rows = render_tree_rows(&browser, 30, 5);
+
+        assert_eq!(rows[0], "root/", "root node should render on first row");
+        assert_eq!(rows[1], "", "no second row");
+    }
+
+    #[test]
+    fn render_tree_with_children() {
+        let browser = make_test_browser(
+            vec![
+                TreeNode::new("src/").with_expanded(false),
+                TreeNode::new("Cargo.toml"),
+                TreeNode::new("README.md"),
+            ],
+            0,
+            0,
+        );
+        let rows = render_tree_rows(&browser, 40, 10);
+
+        assert_eq!(rows[0], "root/");
+        // Children should have guide characters.
+        assert!(
+            rows[1].contains("src/"),
+            "row 1 should contain 'src/': got '{}'",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains("Cargo.toml"),
+            "row 2 should contain 'Cargo.toml': got '{}'",
+            rows[2]
+        );
+        assert!(
+            rows[3].contains("README.md"),
+            "row 3 should contain 'README.md': got '{}'",
+            rows[3]
+        );
+    }
+
+    #[test]
+    fn render_tree_guide_characters() {
+        // Verify that guide characters are correct (├── for non-last, ╰── for last).
+        let browser = make_test_browser(
+            vec![
+                TreeNode::new("first.txt"),
+                TreeNode::new("last.txt"),
+            ],
+            0,
+            0,
+        );
+        let rows = render_tree_rows(&browser, 40, 5);
+
+        // Row 0: root/
+        assert_eq!(rows[0], "root/");
+        // Row 1: ├── first.txt  (branch guide)
+        assert!(
+            rows[1].starts_with("├── "),
+            "non-last child should use branch guide '├── ': got '{}'",
+            rows[1]
+        );
+        assert!(rows[1].contains("first.txt"));
+        // Row 2: ╰── last.txt  (last guide)
+        assert!(
+            rows[2].starts_with("╰── "),
+            "last child should use last guide '╰── ': got '{}'",
+            rows[2]
+        );
+        assert!(rows[2].contains("last.txt"));
+    }
+
+    #[test]
+    fn render_tree_nested_guides() {
+        // Test nested tree with vertical continuation guides.
+        let browser = make_test_browser(
+            vec![
+                TreeNode::new("dir/")
+                    .with_expanded(true)
+                    .with_children(vec![
+                        TreeNode::new("inner.txt"),
+                    ]),
+                TreeNode::new("other.txt"),
+            ],
+            0,
+            0,
+        );
+        let rows = render_tree_rows(&browser, 40, 10);
+
+        // Row 0: root/
+        // Row 1: ├── dir/
+        // Row 2: │   ╰── inner.txt
+        // Row 3: ╰── other.txt
+        assert_eq!(rows[0], "root/");
+        assert!(rows[1].contains("dir/"), "row 1: {}", rows[1]);
+        assert!(
+            rows[2].starts_with("│"),
+            "row 2 should start with vertical guide: got '{}'",
+            rows[2]
+        );
+        assert!(rows[2].contains("inner.txt"), "row 2: {}", rows[2]);
+        assert!(
+            rows[3].starts_with("╰── "),
+            "row 3 should start with last guide: got '{}'",
+            rows[3]
+        );
+    }
+
+    #[test]
+    fn render_tree_selection_color() {
+        // Verify the selected row gets COLOR_SELECTED for its label fg.
+        let browser = make_test_browser(
+            vec![
+                TreeNode::new("file_a.txt"),
+                TreeNode::new("file_b.txt"),
+            ],
+            2, // select file_b.txt (index 0=root, 1=file_a, 2=file_b)
+            0,
+        );
+        let (rows, fgs, _bolds) = render_tree_detailed(&browser, 40, 5);
+
+        // Row 2 is file_b.txt, which is selected.
+        assert!(rows[2].contains("file_b.txt"), "row 2: {}", rows[2]);
+        let label_start = find_col(&rows[2], 'f').expect("should find 'f' in file_b.txt");
+        assert_eq!(
+            fgs[2][label_start], COLOR_SELECTED,
+            "selected label should have COLOR_SELECTED fg"
+        );
+
+        // Row 1 is file_a.txt, NOT selected.
+        let label_a_start = find_col(&rows[1], 'f').expect("should find 'f' in file_a.txt");
+        assert_eq!(
+            fgs[1][label_a_start], COLOR_FILE,
+            "non-selected file should have COLOR_FILE fg"
+        );
+    }
+
+    #[test]
+    fn render_tree_bold_on_selected() {
+        let browser = make_test_browser(
+            vec![TreeNode::new("selected.txt")],
+            1, // select the file
+            0,
+        );
+        let (_rows, _fgs, bolds) = render_tree_detailed(&browser, 40, 5);
+
+        // Row 1 is selected.txt. Guides are 4 chars wide, label starts at col 4.
+        assert!(
+            bolds[1][4],
+            "selected row label should be bold at col 4"
+        );
+        // Row 0 is root/ which is also bold (depth 0 + is_dir).
+        assert!(bolds[0][0], "root label should be bold");
+    }
+
+    #[test]
+    fn render_tree_scrolled_viewport() {
+        // Create a tree taller than the viewport and scroll down.
+        let children: Vec<TreeNode> = (0..20)
+            .map(|i| TreeNode::new(format!("file_{i:02}.txt")))
+            .collect();
+        let browser = make_test_browser(children, 15, 10);
+        // viewport height = 5, scroll = 10, so we see items 10..15
+        let rows = render_tree_rows(&browser, 40, 5);
+
+        // flat_idx 10 = "file_09.txt" (index 0 = root, then 1..20 = files)
+        assert!(
+            rows[0].contains("file_09.txt"),
+            "scrolled row 0 should show file_09.txt: got '{}'",
+            rows[0]
+        );
+        assert!(
+            rows[4].contains("file_13.txt"),
+            "scrolled row 4 should show file_13.txt: got '{}'",
+            rows[4]
+        );
+    }
+
+    #[test]
+    fn render_tree_scroll_keeps_selection_visible() {
+        let children: Vec<TreeNode> = (0..20)
+            .map(|i| TreeNode::new(format!("file_{i:02}.txt")))
+            .collect();
+        let mut browser = make_test_browser(children, 0, 0);
+        browser.tree_height.set(5);
+
+        // Move selection to item 10 (beyond viewport of 5).
+        browser.selected_index = 10;
+        browser.update_tree_scroll();
+
+        assert!(
+            browser.tree_scroll + 5 > 10,
+            "scroll should keep selected_index 10 in viewport of 5, scroll={}",
+            browser.tree_scroll
+        );
+        assert!(
+            browser.tree_scroll <= 10,
+            "scroll should be <= selected_index, scroll={}",
+            browser.tree_scroll
+        );
+    }
+
+    #[test]
+    fn render_tree_scroll_up() {
+        let children: Vec<TreeNode> = (0..20)
+            .map(|i| TreeNode::new(format!("file_{i:02}.txt")))
+            .collect();
+        let mut browser = make_test_browser(children, 15, 15);
+        browser.tree_height.set(5);
+
+        browser.selected_index = 5;
+        browser.update_tree_scroll();
+
+        assert!(
+            browser.tree_scroll <= 5,
+            "scroll should adjust down to show item 5, scroll={}",
+            browser.tree_scroll
+        );
+    }
+
+    #[test]
+    fn render_tree_empty_area() {
+        // Rendering into a 1x1 minimal area should not panic.
+        let browser = make_test_browser(vec![TreeNode::new("test.txt")], 0, 0);
+        let rows = render_tree_rows(&browser, 1, 1);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn render_tree_narrow_viewport() {
+        let browser = make_test_browser(
+            vec![TreeNode::new("very_long_filename_that_exceeds_width.txt")],
+            0,
+            0,
+        );
+        let rows = render_tree_rows(&browser, 10, 3);
+
+        assert_eq!(rows[0], "root/");
+        assert!(
+            rows[1].chars().count() <= 10,
+            "row 1 should be clipped to viewport width (10 cols): got '{}' ({} chars)",
+            rows[1],
+            rows[1].chars().count()
+        );
+    }
+
+    #[test]
+    fn render_tree_selection_at_last_item() {
+        let browser = make_test_browser(
+            vec![
+                TreeNode::new("a.txt"),
+                TreeNode::new("b.txt"),
+                TreeNode::new("z.txt"),
+            ],
+            3, // last visible item
+            0,
+        );
+        let (rows, fgs, _) = render_tree_detailed(&browser, 40, 6);
+
+        assert!(rows[3].contains("z.txt"), "row 3: {}", rows[3]);
+        let label_start = find_col(&rows[3], 'z').unwrap();
+        assert_eq!(
+            fgs[3][label_start], COLOR_SELECTED,
+            "last item when selected should have COLOR_SELECTED fg"
+        );
+    }
+
+    #[test]
+    fn render_tree_dir_color() {
+        // Directories (non-selected) should use COLOR_DIR.
+        let browser = make_test_browser(
+            vec![
+                TreeNode::new("mydir/").with_expanded(false),
+                TreeNode::new("file.txt"),
+            ],
+            2, // select file.txt so mydir/ is NOT selected
+            0,
+        );
+        let (rows, fgs, _bolds) = render_tree_detailed(&browser, 40, 5);
+
+        let dir_start = find_col(&rows[1], 'm').expect("should find 'm' in mydir/");
+        assert_eq!(
+            fgs[1][dir_start], COLOR_DIR,
+            "non-selected directory should have COLOR_DIR fg"
+        );
+    }
+
+    #[test]
+    fn flatten_visible_count_matches() {
+        // Verify flatten_visible produces the same count as TreeNode::visible_count.
+        let root = TreeNode::new("root/")
+            .with_expanded(true)
+            .with_children(vec![
+                TreeNode::new("dir/")
+                    .with_expanded(true)
+                    .with_children(vec![
+                        TreeNode::new("a.txt"),
+                        TreeNode::new("b.txt"),
+                    ]),
+                TreeNode::new("c.txt"),
+            ]);
+        let flat = flatten_visible(&root, true);
+        assert_eq!(
+            flat.len(),
+            root.visible_count(),
+            "flatten_visible count should match visible_count"
+        );
+    }
+
+    #[test]
+    fn flatten_visible_collapsed_dir() {
+        // A collapsed directory should not show its children.
+        let root = TreeNode::new("root/")
+            .with_expanded(true)
+            .with_children(vec![
+                TreeNode::new("collapsed_dir/")
+                    .with_expanded(false)
+                    .with_children(vec![
+                        TreeNode::new("hidden.txt"),
+                    ]),
+                TreeNode::new("visible.txt"),
+            ]);
+        let flat = flatten_visible(&root, true);
+
+        // Should have: root/, collapsed_dir/, visible.txt = 3
+        assert_eq!(flat.len(), 3);
+        assert_eq!(flat[0].label, "root/");
+        assert_eq!(flat[1].label, "collapsed_dir/");
+        assert_eq!(flat[2].label, "visible.txt");
+    }
+
+    #[test]
+    fn flatten_visible_deeply_nested() {
+        let root = TreeNode::new("root/")
+            .with_expanded(true)
+            .with_children(vec![TreeNode::new("a/")
+                .with_expanded(true)
+                .with_children(vec![TreeNode::new("b/")
+                    .with_expanded(true)
+                    .with_children(vec![TreeNode::new("c.txt")])])]);
+
+        let flat = flatten_visible(&root, true);
+        assert_eq!(flat.len(), 4);
+        assert_eq!(flat[0].depth, 0);
+        assert_eq!(flat[1].depth, 1);
+        assert_eq!(flat[2].depth, 2);
+        assert_eq!(flat[3].depth, 3);
+    }
+
+    #[test]
+    fn flat_node_is_last_stack_correctness() {
+        // Verify is_last_stack for guide rendering decisions.
+        let root = TreeNode::new("root/")
+            .with_expanded(true)
+            .with_children(vec![
+                TreeNode::new("first/")
+                    .with_expanded(true)
+                    .with_children(vec![TreeNode::new("inner.txt")]),
+                TreeNode::new("last.txt"),
+            ]);
+
+        let flat = flatten_visible(&root, true);
+
+        // flat[0] = root/ (depth 0, is_last_stack = [true or false])
+        // flat[1] = first/ (depth 1, NOT last child)
+        assert!(!flat[1].is_last_stack[1], "first/ is NOT the last child");
+        // flat[2] = inner.txt (depth 2, IS last child of first/)
+        assert!(flat[2].is_last_stack[2], "inner.txt IS the last child");
+        // flat[3] = last.txt (depth 1, IS last child)
+        assert!(flat[3].is_last_stack[1], "last.txt IS the last child");
+    }
+
+    #[test]
+    fn render_no_stale_content_between_frames() {
+        // Simulate two renders: first with a long tree, then with a short tree.
+        // Verify no stale content from the first render bleeds through.
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(40, 10, &mut pool);
+        let area = Rect::new(0, 0, 40, 10);
+
+        // First render: tree with many items.
+        let browser1 = make_test_browser(
+            (0..8).map(|i| TreeNode::new(format!("file_{i}.txt"))).collect(),
+            0,
+            0,
+        );
+        browser1.tree_height.set(10);
+        // Fill area first (simulates what view() does).
+        frame.buffer.fill(area, RenderCell::default());
+        browser1.render_tree_with_selection(area, &mut frame);
+
+        // Second render: tree with only 2 items, into the SAME frame after clear.
+        frame.buffer.fill(area, RenderCell::default());
+        let browser2 = make_test_browser(
+            vec![TreeNode::new("only.txt")],
+            0,
+            0,
+        );
+        browser2.tree_height.set(10);
+        browser2.render_tree_with_selection(area, &mut frame);
+
+        // Rows after the short tree should be empty.
+        let row5 = row_text(&frame, 5, 40);
+        assert_eq!(row5, "", "row 5 should be empty after short tree render: got '{row5}'");
+    }
 
     #[test]
     fn markdown_render_survives_complex_latex() {
