@@ -12,6 +12,8 @@ use std::cell::Cell;
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use ftui_core::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ftui_core::geometry::Rect;
@@ -36,6 +38,102 @@ use ftui_widgets::{MouseResult, StatefulWidget, Widget};
 const TREE_HIT_ID: HitId = HitId::new(1);
 const PREVIEW_SCROLLBAR_HIT_ID: HitId = HitId::new(3);
 const MAX_PREVIEW_BYTES: u64 = 256 * 1024;
+
+/// Git commit hash baked in at build time by build.rs.
+const BUILD_HASH: &str = env!("BUILD_GIT_HASH");
+
+/// GitHub API endpoint for the latest commit on main.
+const GITHUB_API_URL: &str =
+    "https://api.github.com/repos/l0g1x/terminal/commits/main";
+
+/// How often to check for updates (24 hours).
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(86_400);
+
+// ---------------------------------------------------------------------------
+// Update checker (runs in background via Cmd::task, never blocks the UI)
+// ---------------------------------------------------------------------------
+
+/// XDG cache dir: $XDG_CACHE_HOME/terminal or ~/.cache/terminal
+fn cache_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .map(|d| d.join("terminal"))
+}
+
+/// Returns true if we haven't checked in the last 24 hours.
+fn should_check_for_update() -> bool {
+    let Some(stamp) = cache_dir().map(|d| d.join("last-update-check")) else {
+        return true;
+    };
+    match fs::metadata(&stamp) {
+        Ok(meta) => {
+            let elapsed = meta
+                .modified()
+                .ok()
+                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .unwrap_or(UPDATE_CHECK_INTERVAL);
+            elapsed >= UPDATE_CHECK_INTERVAL
+        }
+        Err(_) => true,
+    }
+}
+
+/// Write a timestamp so we skip checks for the next 24 hours.
+fn touch_update_stamp() {
+    if let Some(dir) = cache_dir() {
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(dir.join("last-update-check"), "");
+    }
+}
+
+/// Blocking function meant to run inside `Cmd::task`.
+/// Shells out to `curl` (available on any system that ran the install script)
+/// to hit the GitHub API and compare the remote HEAD against our build hash.
+fn check_for_update() -> Option<String> {
+    if BUILD_HASH == "unknown" || !should_check_for_update() {
+        return None;
+    }
+
+    touch_update_stamp();
+
+    // 5-second timeout, silent, fail quietly on network errors.
+    let output = Command::new("curl")
+        .args([
+            "-sSf",
+            "--max-time", "5",
+            "-H", "User-Agent: terminal-file-browser",
+            "-H", "Accept: application/vnd.github.v3+json",
+            GITHUB_API_URL,
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let body = String::from_utf8_lossy(&output.stdout);
+
+    // Extract the first "sha":"..." value (the commit SHA) without a JSON crate.
+    let sha_key = "\"sha\":\"";
+    let start = body.find(sha_key)? + sha_key.len();
+    let end = start + body[start..].find('"')?;
+    let remote_sha = &body[start..end];
+
+    if remote_sha.len() >= 7
+        && !BUILD_HASH.starts_with(&remote_sha[..7])
+        && !remote_sha.starts_with(BUILD_HASH)
+    {
+        Some(remote_sha[..7].to_string())
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Color palette
+// ---------------------------------------------------------------------------
 
 // Pre-computed color constants -- avoid re-creating PackedRgba every frame.
 const COLOR_DIR: PackedRgba = PackedRgba::rgb(100, 149, 237);
@@ -110,6 +208,8 @@ struct FileBrowser {
     styles: CachedStyles,
     /// Reusable scratch buffer for path resolution (avoids allocation per call).
     path_scratch: Vec<String>,
+    /// Set when a newer version is detected on GitHub.
+    update_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +228,8 @@ enum Msg {
     Mouse(MouseEvent),
     Resize,
     Tick,
+    /// Background update check completed. Some(hash) = update available.
+    UpdateCheck(Option<String>),
     Noop,
 }
 
@@ -370,6 +472,7 @@ impl FileBrowser {
             scrollbar_state: ScrollbarState::new(0, 0, 0),
             styles: CachedStyles::new(),
             path_scratch: Vec::with_capacity(32),
+            update_notice: None,
         }
     }
 
@@ -516,7 +619,9 @@ impl Model for FileBrowser {
         }
         self.visible_count = self.tree.root().visible_count();
         self.invalidate_path_cache();
-        Cmd::none()
+
+        // Fire a background update check -- runs in a thread, never blocks UI.
+        Cmd::task(|| Msg::UpdateCheck(check_for_update()))
     }
 
     fn update(&mut self, msg: Msg) -> Cmd<Self::Message> {
@@ -650,6 +755,14 @@ impl Model for FileBrowser {
                 self.invalidate_path_cache();
             }
 
+            Msg::UpdateCheck(result) => {
+                if let Some(hash) = result {
+                    self.update_notice = Some(format!(
+                        "Update available ({hash})! Run: curl -sSf https://raw.githubusercontent.com/l0g1x/terminal/main/install.sh | bash"
+                    ));
+                }
+            }
+
             Msg::Tick | Msg::Noop => {}
         }
         Cmd::none()
@@ -738,8 +851,17 @@ impl Model for FileBrowser {
         }
 
         // ---- Status bar ----
-        let status_para = Paragraph::new(Text::raw(&self.status))
-            .style(self.styles.status_style);
+        let status_text = if let Some(ref notice) = self.update_notice {
+            notice.as_str()
+        } else {
+            self.status.as_str()
+        };
+        let status_style = if self.update_notice.is_some() {
+            Style::new().fg(PackedRgba::rgb(255, 200, 60)).bg(COLOR_STATUS_BG).bold()
+        } else {
+            self.styles.status_style
+        };
+        let status_para = Paragraph::new(Text::raw(status_text)).style(status_style);
         status_para.render(status_area, frame);
     }
 }
