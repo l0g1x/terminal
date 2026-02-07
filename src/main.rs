@@ -30,39 +30,42 @@ use ftui_widgets::tree::{Tree, TreeGuides, TreeNode};
 use ftui_widgets::{MouseResult, StatefulWidget, Widget};
 
 // ---------------------------------------------------------------------------
-// Constants
+// Constants & cached styles
 // ---------------------------------------------------------------------------
 
 const TREE_HIT_ID: HitId = HitId::new(1);
 const PREVIEW_SCROLLBAR_HIT_ID: HitId = HitId::new(3);
-const MAX_PREVIEW_BYTES: u64 = 256 * 1024; // 256 KB cap for file preview
+const MAX_PREVIEW_BYTES: u64 = 256 * 1024;
 
-// ---------------------------------------------------------------------------
-// Color palette
-// ---------------------------------------------------------------------------
+// Pre-computed color constants -- avoid re-creating PackedRgba every frame.
+const COLOR_DIR: PackedRgba = PackedRgba::rgb(100, 149, 237);
+const COLOR_FILE: PackedRgba = PackedRgba::rgb(200, 200, 200);
+const COLOR_SELECTED: PackedRgba = PackedRgba::rgb(255, 215, 0);
+const COLOR_BORDER: PackedRgba = PackedRgba::rgb(80, 80, 120);
+const COLOR_STATUS_BG: PackedRgba = PackedRgba::rgb(30, 30, 50);
+const COLOR_STATUS_FG: PackedRgba = PackedRgba::rgb(160, 160, 200);
 
-fn color_dir() -> PackedRgba {
-    PackedRgba::rgb(100, 149, 237) // cornflower blue
+/// Pre-computed styles used in view(). Built once, reused every frame.
+struct CachedStyles {
+    file_style: Style,
+    status_style: Style,
+    border_focus: Style,
+    border_unfocus: Style,
+    scrollbar_thumb: Style,
+    scrollbar_track: Style,
 }
 
-fn color_file() -> PackedRgba {
-    PackedRgba::rgb(200, 200, 200) // light gray
-}
-
-fn color_selected() -> PackedRgba {
-    PackedRgba::rgb(255, 215, 0) // gold
-}
-
-fn color_border() -> PackedRgba {
-    PackedRgba::rgb(80, 80, 120) // muted blue-gray
-}
-
-fn color_status_bg() -> PackedRgba {
-    PackedRgba::rgb(30, 30, 50)
-}
-
-fn color_status_fg() -> PackedRgba {
-    PackedRgba::rgb(160, 160, 200)
+impl CachedStyles {
+    fn new() -> Self {
+        Self {
+            file_style: Style::new().fg(COLOR_FILE),
+            status_style: Style::new().fg(COLOR_STATUS_FG).bg(COLOR_STATUS_BG),
+            border_focus: Style::new().fg(COLOR_SELECTED),
+            border_unfocus: Style::new().fg(COLOR_BORDER),
+            scrollbar_thumb: Style::new().fg(COLOR_SELECTED),
+            scrollbar_track: Style::new().fg(COLOR_BORDER),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +84,10 @@ struct FileBrowser {
     visible_count: usize,
     /// Path of the currently selected file (if any).
     selected_file: Option<PathBuf>,
+    /// Cached resolved path for the current selected_index (avoids re-walking tree).
+    cached_path: Option<PathBuf>,
+    /// Cached selected_index that `cached_path` corresponds to.
+    cached_path_index: usize,
     /// Rendered preview text for the selected file.
     preview_text: Text,
     /// Whether the selected file is markdown (for rendering).
@@ -93,10 +100,16 @@ struct FileBrowser {
     focus: Pane,
     /// Status message shown at bottom.
     status: String,
+    /// Cached preview pane title string (only rebuilt on file selection change).
+    preview_title: String,
     /// Markdown renderer instance.
     md_renderer: MarkdownRenderer,
     /// Scrollbar state for preview pane.
     scrollbar_state: ScrollbarState,
+    /// Pre-computed styles reused every frame.
+    styles: CachedStyles,
+    /// Reusable scratch buffer for path resolution (avoids allocation per call).
+    path_scratch: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +167,6 @@ fn build_tree_node(path: &Path) -> TreeNode {
             let mut files: Vec<PathBuf> = Vec::new();
             for entry in entries.flatten() {
                 let p = entry.path();
-                // Skip hidden files/dirs
                 if p.file_name()
                     .map_or(false, |n| n.to_string_lossy().starts_with('.'))
                 {
@@ -168,7 +180,6 @@ fn build_tree_node(path: &Path) -> TreeNode {
             }
             dirs.sort();
             files.sort();
-            // Add directories first, then files
             for d in &dirs {
                 node = node.child(build_tree_node(d));
             }
@@ -219,8 +230,6 @@ fn reload_children(node: &mut TreeNode, path: &Path) {
             .map_or_else(|| f.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
         children.push(TreeNode::new(fname).with_expanded(false));
     }
-    // We need to replace the node's children.
-    // TreeNode uses builder pattern, so we rebuild:
     let label = node.label().to_string();
     let expanded = node.is_expanded();
     *node = TreeNode::new(label)
@@ -229,13 +238,12 @@ fn reload_children(node: &mut TreeNode, path: &Path) {
 }
 
 /// Given a visible index in the tree, resolve the filesystem path.
-fn resolve_path_for_index(root: &Path, tree: &Tree, index: usize) -> Option<PathBuf> {
-    // Walk the tree to find the path components leading to the node at `index`.
-    let mut path_parts: Vec<String> = Vec::new();
-    if collect_path_at_index(tree.root(), index, &mut path_parts, tree.root().label().ends_with('/')) {
+/// Uses a pre-allocated scratch buffer to avoid allocations.
+fn resolve_path_for_index(root: &Path, tree: &Tree, index: usize, scratch: &mut Vec<String>) -> Option<PathBuf> {
+    scratch.clear();
+    if collect_path_at_index(tree.root(), index, scratch, tree.root().label().ends_with('/')) {
         let mut full_path = root.to_path_buf();
-        // Skip root node label from path (it represents the root dir itself)
-        for part in &path_parts[1..] {
+        for part in &scratch[1..] {
             let clean = part.trim_end_matches('/');
             full_path = full_path.join(clean);
         }
@@ -245,15 +253,12 @@ fn resolve_path_for_index(root: &Path, tree: &Tree, index: usize) -> Option<Path
     }
 }
 
-/// Recursively collect the label path to the node at the given visible index.
-/// Returns true if found and populates `path`.
 fn collect_path_at_index(
     node: &TreeNode,
     target: usize,
     path: &mut Vec<String>,
     show_root: bool,
 ) -> bool {
-    // We track a counter through a mutable reference to find the target.
     let mut counter: usize = 0;
     collect_path_recursive(node, target, path, &mut counter, show_root)
 }
@@ -297,7 +302,6 @@ fn is_markdown_file(path: &Path) -> bool {
 fn read_file_preview(path: &Path) -> Result<String, String> {
     let metadata = fs::metadata(path).map_err(|e| format!("Cannot read: {e}"))?;
     if metadata.len() > MAX_PREVIEW_BYTES {
-        // Read partial
         let content = fs::read(path).map_err(|e| format!("Cannot read: {e}"))?;
         let truncated = &content[..MAX_PREVIEW_BYTES as usize];
         let truncated_str = String::from_utf8(truncated.to_vec())
@@ -338,9 +342,9 @@ impl FileBrowser {
         let tree = Tree::new(tree_root)
             .with_show_root(true)
             .with_guides(TreeGuides::Rounded)
-            .with_guide_style(Style::new().fg(color_border()))
-            .with_label_style(Style::new().fg(color_file()))
-            .with_root_style(Style::new().fg(color_dir()).bold())
+            .with_guide_style(Style::new().fg(COLOR_BORDER))
+            .with_label_style(Style::new().fg(COLOR_FILE))
+            .with_root_style(Style::new().fg(COLOR_DIR).bold())
             .hit_id(TREE_HIT_ID);
 
         let root_name = root
@@ -353,20 +357,41 @@ impl FileBrowser {
             selected_index: 0,
             visible_count: visible,
             selected_file: None,
+            cached_path: None,
+            cached_path_index: usize::MAX,
             preview_text: Text::raw("Select a file to preview"),
             is_markdown: false,
             preview_scroll: 0,
             preview_height: Cell::new(0),
             focus: Pane::Tree,
             status: format!("  {root_name}/ | arrows: navigate | Enter: open | Tab: switch pane | q: quit"),
+            preview_title: " Preview ".to_string(),
             md_renderer: MarkdownRenderer::new(MarkdownTheme::default()),
             scrollbar_state: ScrollbarState::new(0, 0, 0),
+            styles: CachedStyles::new(),
+            path_scratch: Vec::with_capacity(32),
         }
+    }
+
+    /// Resolve the filesystem path for the current selected_index, using cache.
+    fn resolve_current_path(&mut self) -> Option<PathBuf> {
+        if self.cached_path_index == self.selected_index {
+            return self.cached_path.clone();
+        }
+        let path = resolve_path_for_index(&self.root, &self.tree, self.selected_index, &mut self.path_scratch);
+        self.cached_path = path.clone();
+        self.cached_path_index = self.selected_index;
+        path
+    }
+
+    /// Invalidate the path cache (call after tree structure changes).
+    fn invalidate_path_cache(&mut self) {
+        self.cached_path_index = usize::MAX;
+        self.cached_path = None;
     }
 
     /// Select a file and load its preview.
     fn select_file(&mut self, path: PathBuf) {
-        // Update status bar
         let size_str = fs::metadata(&path)
             .map(|m| human_size(m.len()))
             .unwrap_or_else(|_| "?".into());
@@ -376,12 +401,16 @@ impl FileBrowser {
         self.status = format!("  {name} | {size_str} | Tab: switch pane | q: quit");
         self.is_markdown = is_markdown_file(&path);
 
+        // Update cached preview title (only rebuilt on file change, not every frame)
+        self.preview_title = if self.is_markdown {
+            format!(" {name} (Markdown) ")
+        } else {
+            format!(" {name} ")
+        };
+
         match read_file_preview(&path) {
             Ok(content) => {
                 if self.is_markdown {
-                    // Wrap in catch_unwind: the `unicodeit` crate (used for
-                    // LaTeX-to-Unicode math rendering) can panic on certain
-                    // complex expressions. Fall back to raw text on panic.
                     let renderer = &self.md_renderer;
                     let rendered =
                         std::panic::catch_unwind(AssertUnwindSafe(|| renderer.render(&content)));
@@ -404,41 +433,38 @@ impl FileBrowser {
 
         self.selected_file = Some(path);
         self.preview_scroll = 0;
-        // Update scrollbar
         let total = self.preview_text.height();
         self.scrollbar_state = ScrollbarState::new(total, 0, self.preview_height.get() as usize);
     }
 
-    /// Handle tree navigation: move selection up.
-    fn move_up(&mut self) {
-        if self.selected_index > 0 {
-            self.selected_index -= 1;
-            self.on_selection_changed();
-        }
-    }
-
-    /// Handle tree navigation: move selection down.
-    fn move_down(&mut self) {
-        if self.selected_index + 1 < self.visible_count {
-            self.selected_index += 1;
+    /// Move tree selection by `delta` steps without triggering file I/O for
+    /// intermediate positions. Only resolves + previews the final position.
+    fn move_selection_by(&mut self, delta: isize) {
+        let new_index = if delta > 0 {
+            (self.selected_index + delta as usize).min(self.visible_count.saturating_sub(1))
+        } else {
+            self.selected_index.saturating_sub((-delta) as usize)
+        };
+        if new_index != self.selected_index {
+            self.selected_index = new_index;
             self.on_selection_changed();
         }
     }
 
     /// Called when the tree selection changes to potentially preview a file.
     fn on_selection_changed(&mut self) {
-        if let Some(path) = resolve_path_for_index(&self.root, &self.tree, self.selected_index) {
+        if let Some(path) = self.resolve_current_path() {
             if path.is_file() {
                 self.select_file(path);
             } else {
-                // It's a directory - show info
+                // Directory -- show basic info without expensive fs::read_dir count
                 let name = path
                     .file_name()
                     .map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
-                let count = fs::read_dir(&path).map(|rd| rd.count()).unwrap_or(0);
-                self.status = format!("  {name}/ | {count} items | Enter: expand | q: quit");
+                self.status = format!("  {name}/ | Enter: expand | q: quit");
                 self.selected_file = None;
-                self.preview_text = Text::raw(format!("Directory: {}\n\n{count} items", path.display()));
+                self.preview_title = " Preview ".to_string();
+                self.preview_text = Text::raw(format!("Directory: {}", path.display()));
                 self.preview_scroll = 0;
             }
         }
@@ -446,9 +472,8 @@ impl FileBrowser {
 
     /// Handle Enter key: toggle expand for dirs, select file.
     fn handle_enter(&mut self) {
-        if let Some(path) = resolve_path_for_index(&self.root, &self.tree, self.selected_index) {
+        if let Some(path) = self.resolve_current_path() {
             if path.is_dir() {
-                // Toggle expansion and lazy-load children
                 if let Some(node) = self.tree.node_at_visible_index_mut(self.selected_index) {
                     if !node.is_expanded() {
                         reload_children(node, &path);
@@ -456,6 +481,7 @@ impl FileBrowser {
                     node.toggle_expanded();
                 }
                 self.visible_count = self.tree.root().visible_count();
+                self.invalidate_path_cache();
             } else if path.is_file() {
                 self.select_file(path);
                 self.focus = Pane::Preview;
@@ -481,7 +507,6 @@ impl Model for FileBrowser {
     type Message = Msg;
 
     fn init(&mut self) -> Cmd<Self::Message> {
-        // Expand root directory on startup
         let root_path = self.root.clone();
         if let Some(root_node) = self.tree.node_at_visible_index_mut(0) {
             reload_children(root_node, &root_path);
@@ -490,6 +515,7 @@ impl Model for FileBrowser {
             }
         }
         self.visible_count = self.tree.root().visible_count();
+        self.invalidate_path_cache();
         Cmd::none()
     }
 
@@ -500,14 +526,14 @@ impl Model for FileBrowser {
 
                 KeyCode::Up | KeyCode::Char('k') => {
                     if self.focus == Pane::Tree {
-                        self.move_up();
+                        self.move_selection_by(-1);
                     } else {
                         self.scroll_preview_up(1);
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if self.focus == Pane::Tree {
-                        self.move_down();
+                        self.move_selection_by(1);
                     } else {
                         self.scroll_preview_down(1);
                     }
@@ -516,18 +542,15 @@ impl Model for FileBrowser {
                     if self.focus == Pane::Preview {
                         self.scroll_preview_up(self.preview_height.get().saturating_sub(2));
                     } else {
-                        for _ in 0..10 {
-                            self.move_up();
-                        }
+                        // Jump 10 items in one step -- no intermediate file reads
+                        self.move_selection_by(-10);
                     }
                 }
                 KeyCode::PageDown => {
                     if self.focus == Pane::Preview {
                         self.scroll_preview_down(self.preview_height.get().saturating_sub(2));
                     } else {
-                        for _ in 0..10 {
-                            self.move_down();
-                        }
+                        self.move_selection_by(10);
                     }
                 }
                 KeyCode::Home => {
@@ -558,15 +581,15 @@ impl Model for FileBrowser {
                 }
                 KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
                     if self.focus == Pane::Tree {
-                        // Collapse current node if expanded, or move to parent
                         if let Some(node) =
                             self.tree.node_at_visible_index_mut(self.selected_index)
                         {
                             if node.is_expanded() && !node.children().is_empty() {
                                 node.toggle_expanded();
                                 self.visible_count = self.tree.root().visible_count();
+                                self.invalidate_path_cache();
                             } else if self.selected_index > 0 {
-                                self.move_up();
+                                self.move_selection_by(-1);
                             }
                         }
                     } else {
@@ -586,17 +609,13 @@ impl Model for FileBrowser {
 
             Msg::Mouse(me) => match me.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    // Check if click is in tree area (handled via hit testing in view)
-                    // We store the last frame's hit grid, so we do manual area checks.
-                    // For simplicity, use x position: left half = tree, right half = preview
-                    // The actual hit testing is more sophisticated via HitId, but we'll
-                    // check if the tree widget handled it.
                     let result =
                         self.tree
                             .handle_mouse(&me, Some((TREE_HIT_ID, HitRegion::Content, 0)), TREE_HIT_ID);
                     match result {
                         MouseResult::Selected(idx) | MouseResult::Activated(idx) => {
                             self.selected_index = idx;
+                            self.invalidate_path_cache();
                             self.focus = Pane::Tree;
                             if result == MouseResult::Activated(idx) {
                                 self.handle_enter();
@@ -605,7 +624,6 @@ impl Model for FileBrowser {
                             }
                         }
                         _ => {
-                            // Might be a click in the preview pane
                             self.focus = Pane::Preview;
                         }
                     }
@@ -614,22 +632,22 @@ impl Model for FileBrowser {
                     if self.focus == Pane::Preview {
                         self.scroll_preview_up(3);
                     } else {
-                        self.move_up();
+                        self.move_selection_by(-1);
                     }
                 }
                 MouseEventKind::ScrollDown => {
                     if self.focus == Pane::Preview {
                         self.scroll_preview_down(3);
                     } else {
-                        self.move_down();
+                        self.move_selection_by(1);
                     }
                 }
                 _ => {}
             },
 
             Msg::Resize => {
-                // Recalculate visible count (tree may have changed)
                 self.visible_count = self.tree.root().visible_count();
+                self.invalidate_path_cache();
             }
 
             Msg::Tick | Msg::Noop => {}
@@ -643,7 +661,7 @@ impl Model for FileBrowser {
             return;
         }
 
-        // Main layout: tree | preview (vertical split), status bar at bottom
+        // Main layout: tree | preview, status bar at bottom
         let vert_areas = Flex::vertical()
             .constraints([Constraint::Fill, Constraint::Fixed(1)])
             .split(total_area);
@@ -651,7 +669,6 @@ impl Model for FileBrowser {
         let main_area = vert_areas[0];
         let status_area = vert_areas[1];
 
-        // Horizontal split: tree (30%) | preview (70%)
         let horiz_areas = Flex::horizontal()
             .constraints([Constraint::Percentage(30.0), Constraint::Fill])
             .split(main_area);
@@ -659,68 +676,53 @@ impl Model for FileBrowser {
         let tree_area = horiz_areas[0];
         let preview_area = horiz_areas[1];
 
-        // ---- Render tree pane ----
-        let tree_focus_style = if self.focus == Pane::Tree {
-            Style::new().fg(color_selected())
+        // ---- Tree pane ----
+        let tree_border = if self.focus == Pane::Tree {
+            self.styles.border_focus
         } else {
-            Style::new().fg(color_border())
+            self.styles.border_unfocus
         };
 
         let tree_block = Block::bordered()
             .title(" Files ")
             .title_alignment(Alignment::Left)
-            .border_style(tree_focus_style)
+            .border_style(tree_border)
             .border_type(BorderType::Rounded);
 
         let inner_tree_area = tree_block.inner(tree_area);
         tree_block.render(tree_area, frame);
-
-        // Render tree with selection highlighting
-        // We render the tree manually line-by-line to support selection highlighting
         self.render_tree_with_selection(inner_tree_area, frame);
 
-        // ---- Render preview pane ----
-        let preview_focus_style = if self.focus == Pane::Preview {
-            Style::new().fg(color_selected())
+        // ---- Preview pane ----
+        let preview_border = if self.focus == Pane::Preview {
+            self.styles.border_focus
         } else {
-            Style::new().fg(color_border())
-        };
-
-        let preview_title = if let Some(ref file) = self.selected_file {
-            let name = file
-                .file_name()
-                .map_or_else(|| "Preview".into(), |n| n.to_string_lossy().into_owned());
-            if self.is_markdown {
-                format!(" {name} (Markdown) ")
-            } else {
-                format!(" {name} ")
-            }
-        } else {
-            " Preview ".to_string()
+            self.styles.border_unfocus
         };
 
         let preview_block = Block::bordered()
-            .title(&*preview_title)
+            .title(&*self.preview_title)
             .title_alignment(Alignment::Left)
-            .border_style(preview_focus_style)
+            .border_style(preview_border)
             .border_type(BorderType::Rounded);
 
         let inner_preview_area = preview_block.inner(preview_area);
         preview_block.render(preview_area, frame);
 
-        // Store preview height via Cell for scroll calculations.
         let ph = inner_preview_area.height;
         self.preview_height.set(ph);
 
-        // Render preview content with scroll
+        // Clone preview_text for Paragraph -- this is the remaining unavoidable
+        // clone since Paragraph::new() consumes the Text. The Text struct itself
+        // is relatively cheap (Vec of Lines/Spans with small string data).
         let preview_paragraph = Paragraph::new(self.preview_text.clone())
-            .style(Style::new().fg(color_file()))
+            .style(self.styles.file_style)
             .wrap(WrapMode::Word)
             .scroll((self.preview_scroll, 0));
 
         preview_paragraph.render(inner_preview_area, frame);
 
-        // Render scrollbar for preview pane
+        // Scrollbar (only when content overflows)
         if self.preview_text.height() > ph as usize {
             let mut sb_state = ScrollbarState::new(
                 self.preview_text.height(),
@@ -728,35 +730,29 @@ impl Model for FileBrowser {
                 ph as usize,
             );
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .thumb_style(Style::new().fg(color_selected()))
-                .track_style(Style::new().fg(color_border()))
+                .thumb_style(self.styles.scrollbar_thumb)
+                .track_style(self.styles.scrollbar_track)
                 .hit_id(PREVIEW_SCROLLBAR_HIT_ID);
             StatefulWidget::render(&scrollbar, inner_preview_area, frame, &mut sb_state);
         }
 
-        // ---- Render status bar ----
+        // ---- Status bar ----
         let status_para = Paragraph::new(Text::raw(&self.status))
-            .style(Style::new().fg(color_status_fg()).bg(color_status_bg()));
+            .style(self.styles.status_style);
         status_para.render(status_area, frame);
     }
 }
 
 impl FileBrowser {
-    /// Render the tree with selection highlighting.
-    /// The built-in Tree widget doesn't highlight a "selected" row, so we
-    /// render the Tree widget normally and then overlay the selected row style.
     fn render_tree_with_selection(&self, area: Rect, frame: &mut Frame) {
         if area.is_empty() || self.visible_count == 0 {
             return;
         }
 
-        // Render the tree widget
         self.tree.render(area, frame);
 
-        // Clamp selected_index to valid range
         let selected = self.selected_index.min(self.visible_count.saturating_sub(1));
 
-        // Highlight the selected row by overwriting its style
         let visible_start = if selected >= area.height as usize {
             selected - area.height as usize + 1
         } else {
@@ -768,7 +764,7 @@ impl FileBrowser {
             let y = area.y + row_in_viewport as u16;
             for x in area.x..area.right() {
                 if let Some(cell) = frame.buffer.get_mut(x, y) {
-                    cell.fg = color_selected();
+                    cell.fg = COLOR_SELECTED;
                 }
             }
         }
@@ -783,14 +779,9 @@ impl FileBrowser {
 mod tests {
     use super::*;
 
-    /// Verify markdown renderer doesn't crash the app when unicodeit panics
-    /// on complex LaTeX math expressions.
     #[test]
     fn markdown_render_survives_complex_latex() {
         let renderer = MarkdownRenderer::new(MarkdownTheme::default());
-
-        // This is the kind of content from FrankenTUI's README that triggers
-        // the unicodeit panic: Bayesian formulas with sub/superscript groups.
         let nasty_markdown = r#"# Math-Heavy Document
 
 ## Bayesian Scoring
@@ -822,28 +813,18 @@ $$
 "#;
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| renderer.render(nasty_markdown)));
-
-        // Whether it succeeds or panics, we should not crash.
         match result {
-            Ok(text) => {
-                // Rendered successfully - verify we got some output
-                assert!(text.height() > 0, "rendered text should have content");
-            }
-            Err(_) => {
-                // Panic was caught - this is the expected path for the
-                // unicodeit bug. The app would show raw fallback text.
-            }
+            Ok(text) => assert!(text.height() > 0, "rendered text should have content"),
+            Err(_) => {} // Panic caught -- app would show fallback
         }
     }
 
-    /// Verify that non-markdown files render without issues.
     #[test]
     fn plain_text_preview_works() {
         let text = Text::raw("Hello, world!\nLine 2\nLine 3");
         assert_eq!(text.height(), 3);
     }
 
-    /// Verify tree node construction from a real directory.
     #[test]
     fn build_tree_from_temp_dir() {
         let dir = std::env::temp_dir().join("ftui_test_tree");
@@ -853,20 +834,16 @@ $$
         let _ = fs::write(dir.join(".hidden"), "secret");
 
         let node = build_tree_node(&dir);
-        // Root should be a dir
         assert!(node.label().ends_with('/'));
-        // Hidden file should be excluded
         let child_labels: Vec<&str> = node.children().iter().map(|c| c.label()).collect();
         assert!(
             !child_labels.iter().any(|l| l.starts_with('.')),
             "hidden files should be excluded: {child_labels:?}"
         );
 
-        // Cleanup
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Verify path resolution round-trips correctly.
     #[test]
     fn path_resolution_for_root() {
         let dir = std::env::temp_dir().join("ftui_test_resolve");
@@ -876,14 +853,13 @@ $$
         let root_node = build_tree_node(&dir);
         let tree = Tree::new(root_node).with_show_root(true);
 
-        // Index 0 should be the root itself
-        let resolved = resolve_path_for_index(&dir, &tree, 0);
+        let mut scratch = Vec::new();
+        let resolved = resolve_path_for_index(&dir, &tree, 0, &mut scratch);
         assert!(resolved.is_some(), "root should resolve");
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Verify human_size formatting.
     #[test]
     fn human_size_formatting() {
         assert_eq!(human_size(0), "0.0 B");
@@ -893,7 +869,6 @@ $$
         assert_eq!(human_size(1_073_741_824), "1.0 GB");
     }
 
-    /// Verify is_markdown_file detection.
     #[test]
     fn markdown_detection() {
         assert!(is_markdown_file(Path::new("README.md")));
@@ -904,17 +879,15 @@ $$
         assert!(!is_markdown_file(Path::new("noext")));
     }
 
-    /// Verify that rendering the actual FrankenTUI README doesn't crash.
     #[test]
     fn frankentui_readme_survives() {
         let readme_path = Path::new("/home/krystian/frankentui/README.md");
         if !readme_path.exists() {
-            return; // Skip if frankentui not cloned
+            return;
         }
         let content = fs::read_to_string(readme_path).unwrap();
         let renderer = MarkdownRenderer::new(MarkdownTheme::default());
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| renderer.render(&content)));
-        // Must not propagate the panic
         assert!(
             result.is_ok() || result.is_err(),
             "catch_unwind should always return Ok or Err"
@@ -923,7 +896,6 @@ $$
 }
 
 fn main() -> std::io::Result<()> {
-    // Determine starting directory from command-line arg or current directory
     let start_dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
