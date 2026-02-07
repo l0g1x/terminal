@@ -136,6 +136,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "ftui"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -150,6 +151,7 @@ dependencies = [
 [[package]]
 name = "ftui-core"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "bitflags",
  "crossterm",
@@ -162,6 +164,7 @@ dependencies = [
 [[package]]
 name = "ftui-extras"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -179,10 +182,12 @@ dependencies = [
 [[package]]
 name = "ftui-i18n"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 
 [[package]]
 name = "ftui-layout"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -191,6 +196,7 @@ dependencies = [
 [[package]]
 name = "ftui-render"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "bitflags",
  "ftui-core",
@@ -204,6 +210,7 @@ dependencies = [
 [[package]]
 name = "ftui-runtime"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "crossterm",
  "ftui-core",
@@ -220,6 +227,7 @@ dependencies = [
 [[package]]
 name = "ftui-style"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "ftui-render",
  "tracing",
@@ -228,6 +236,7 @@ dependencies = [
 [[package]]
 name = "ftui-text"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -244,6 +253,7 @@ dependencies = [
 [[package]]
 name = "ftui-widgets"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui.git#c21705ce1c01e6db218ca9785687bd2a638bfc00"
 dependencies = [
  "bitflags",
  "ftui-core",

@@ -3,13 +3,17 @@ name = "file-browser"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "terminal"
+path = "src/main.rs"
+
 [dependencies]
-ftui = { path = "/home/krystian/frankentui/crates/ftui" }
-ftui-core = { path = "/home/krystian/frankentui/crates/ftui-core" }
-ftui-render = { path = "/home/krystian/frankentui/crates/ftui-render" }
-ftui-style = { path = "/home/krystian/frankentui/crates/ftui-style" }
-ftui-text = { path = "/home/krystian/frankentui/crates/ftui-text" }
-ftui-layout = { path = "/home/krystian/frankentui/crates/ftui-layout" }
-ftui-runtime = { path = "/home/krystian/frankentui/crates/ftui-runtime" }
-ftui-widgets = { path = "/home/krystian/frankentui/crates/ftui-widgets" }
-ftui-extras = { path = "/home/krystian/frankentui/crates/ftui-extras", features = ["markdown", "syntax"] }
+ftui = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+ftui-core = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+ftui-render = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+ftui-style = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+ftui-text = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+ftui-layout = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+ftui-widgets = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+ftui-extras = { git = "https://github.com/Dicklesworthstone/frankentui.git", features = ["markdown", "syntax"] }
