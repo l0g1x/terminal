@@ -19,7 +19,7 @@ use ftui_core::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, Mo
 use ftui_core::geometry::Rect;
 use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme};
 use ftui_layout::{Constraint, Flex};
-use ftui_render::cell::{Cell as RenderCell, PackedRgba};
+use ftui_render::cell::{Cell as RenderCell, CellContent, PackedRgba, StyleFlags};
 use ftui_render::frame::{Frame, HitId, HitRegion};
 use ftui_runtime::program::{Cmd, Model, Program, ProgramConfig};
 use ftui_style::Style;
@@ -210,6 +210,10 @@ struct FileBrowser {
     path_scratch: Vec<String>,
     /// Set when a newer version is detected on GitHub.
     update_notice: Option<String>,
+    /// First visible node index in the tree viewport (scroll offset).
+    tree_scroll: usize,
+    /// Height of the tree pane (updated each frame from view()).
+    tree_height: Cell<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,6 +451,8 @@ impl FileBrowser {
             styles: CachedStyles::new(),
             path_scratch: Vec::with_capacity(32),
             update_notice: None,
+            tree_scroll: 0,
+            tree_height: Cell::new(0),
         }
     }
 
@@ -514,6 +520,19 @@ impl FileBrowser {
         self.scrollbar_state = ScrollbarState::new(total, 0, self.preview_height.get() as usize);
     }
 
+    /// Keep `tree_scroll` in sync so `selected_index` is always visible.
+    fn update_tree_scroll(&mut self) {
+        let h = self.tree_height.get() as usize;
+        if h == 0 {
+            return;
+        }
+        if self.selected_index < self.tree_scroll {
+            self.tree_scroll = self.selected_index;
+        } else if self.selected_index >= self.tree_scroll + h {
+            self.tree_scroll = self.selected_index - h + 1;
+        }
+    }
+
     /// Move tree selection by `delta` steps without triggering file I/O for
     /// intermediate positions. Only resolves + previews the final position.
     fn move_selection_by(&mut self, delta: isize) {
@@ -524,6 +543,7 @@ impl FileBrowser {
         };
         if new_index != self.selected_index {
             self.selected_index = new_index;
+            self.update_tree_scroll();
             self.on_selection_changed();
         }
     }
@@ -559,6 +579,7 @@ impl FileBrowser {
                 }
                 self.visible_count = self.tree.root().visible_count();
                 self.invalidate_path_cache();
+                self.update_tree_scroll();
             } else if path.is_file() {
                 self.select_file(path);
                 self.focus = Pane::Preview;
@@ -635,6 +656,7 @@ impl Model for FileBrowser {
                 KeyCode::Home => {
                     if self.focus == Pane::Tree {
                         self.selected_index = 0;
+                        self.update_tree_scroll();
                         self.on_selection_changed();
                     } else {
                         self.preview_scroll = 0;
@@ -644,6 +666,7 @@ impl Model for FileBrowser {
                 KeyCode::End => {
                     if self.focus == Pane::Tree {
                         self.selected_index = self.visible_count.saturating_sub(1);
+                        self.update_tree_scroll();
                         self.on_selection_changed();
                     } else {
                         let max = (self.preview_text.height() as u16)
@@ -667,6 +690,7 @@ impl Model for FileBrowser {
                                 node.toggle_expanded();
                                 self.visible_count = self.tree.root().visible_count();
                                 self.invalidate_path_cache();
+                                self.update_tree_scroll();
                             } else if self.selected_index > 0 {
                                 self.move_selection_by(-1);
                             }
@@ -695,6 +719,7 @@ impl Model for FileBrowser {
                         MouseResult::Selected(idx) | MouseResult::Activated(idx) => {
                             self.selected_index = idx;
                             self.invalidate_path_cache();
+                            self.update_tree_scroll();
                             self.focus = Pane::Tree;
                             if result == MouseResult::Activated(idx) {
                                 self.handle_enter();
@@ -778,6 +803,8 @@ impl Model for FileBrowser {
 
         let inner_tree_area = tree_block.inner(tree_area);
         tree_block.render(tree_area, frame);
+        self.tree_height.set(inner_tree_area.height);
+        frame.buffer.fill(inner_tree_area, RenderCell::default());
         self.render_tree_with_selection(inner_tree_area, frame);
 
         // ---- Preview pane ----
@@ -840,29 +867,153 @@ impl Model for FileBrowser {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Manual tree renderer with scrolling + selection highlighting
+// ---------------------------------------------------------------------------
+
+/// A flattened visible tree node for rendering.
+struct FlatNode<'a> {
+    label: &'a str,
+    depth: usize,
+    is_dir: bool,
+    /// For each depth 0..depth, whether the ancestor at that level was the
+    /// last child (determines │ vs blank in guide columns).
+    is_last_stack: Vec<bool>,
+}
+
+/// Flatten the visible tree into a linear list for viewport rendering.
+fn flatten_visible<'a>(node: &'a TreeNode, show_root: bool) -> Vec<FlatNode<'a>> {
+    let mut out = Vec::new();
+    let mut stack = Vec::new();
+    if show_root {
+        flatten_walk(node, 0, &mut stack, &mut out, true);
+    } else if node.is_expanded() {
+        let child_count = node.children().len();
+        for (i, child) in node.children().iter().enumerate() {
+            stack.clear();
+            stack.push(i == child_count - 1);
+            flatten_walk(child, 0, &mut stack, &mut out, i == child_count - 1);
+        }
+    }
+    out
+}
+
+fn flatten_walk<'a>(
+    node: &'a TreeNode,
+    depth: usize,
+    is_last_stack: &mut Vec<bool>,
+    out: &mut Vec<FlatNode<'a>>,
+    is_last: bool,
+) {
+    // Ensure the stack has the correct entry for this depth.
+    if is_last_stack.len() <= depth {
+        is_last_stack.push(is_last);
+    } else {
+        is_last_stack[depth] = is_last;
+    }
+
+    out.push(FlatNode {
+        label: node.label(),
+        depth,
+        is_dir: node.label().ends_with('/'),
+        is_last_stack: is_last_stack[..=depth].to_vec(),
+    });
+
+    if node.is_expanded() {
+        let child_count = node.children().len();
+        for (i, child) in node.children().iter().enumerate() {
+            flatten_walk(child, depth + 1, is_last_stack, out, i == child_count - 1);
+        }
+    }
+}
+
 impl FileBrowser {
+    /// Render the tree manually with viewport scrolling and selection highlight.
     fn render_tree_with_selection(&self, area: Rect, frame: &mut Frame) {
         if area.is_empty() || self.visible_count == 0 {
             return;
         }
 
-        self.tree.render(area, frame);
+        let viewport_h = area.height as usize;
+        let guides = TreeGuides::Rounded;
 
+        // Flatten the visible tree.
+        let flat = flatten_visible(self.tree.root(), true);
+
+        // Determine viewport slice.
+        let scroll = self.tree_scroll;
+        let end = (scroll + viewport_h).min(flat.len());
+
+        let guide_style = Style::new().fg(COLOR_BORDER);
         let selected = self.selected_index.min(self.visible_count.saturating_sub(1));
 
-        let visible_start = if selected >= area.height as usize {
-            selected - area.height as usize + 1
-        } else {
-            0
-        };
+        for (row_idx, flat_idx) in (scroll..end).enumerate() {
+            let node = &flat[flat_idx];
+            let y = area.y + row_idx as u16;
+            let mut x = area.x;
+            let max_x = area.right();
 
-        let row_in_viewport = selected.saturating_sub(visible_start);
-        if row_in_viewport < area.height as usize {
-            let y = area.y + row_in_viewport as u16;
-            for x in area.x..area.right() {
-                if let Some(cell) = frame.buffer.get_mut(x, y) {
-                    cell.fg = COLOR_SELECTED;
+            let is_selected = flat_idx == selected;
+
+            // Determine styles for this row.
+            let label_fg = if is_selected {
+                COLOR_SELECTED
+            } else if node.is_dir {
+                COLOR_DIR
+            } else {
+                COLOR_FILE
+            };
+
+            // Draw guide characters for each depth level.
+            for d in 0..node.depth {
+                if x + 4 > max_x {
+                    break;
                 }
+                let guide_str = if d + 1 == node.depth {
+                    // This is the immediate parent connection.
+                    if node.is_last_stack[d + 1] {
+                        guides.last()
+                    } else {
+                        guides.branch()
+                    }
+                } else {
+                    // Continuation from ancestor.
+                    if d + 1 < node.is_last_stack.len() && node.is_last_stack[d + 1] {
+                        guides.space()
+                    } else {
+                        guides.vertical()
+                    }
+                };
+
+                let gfg = if is_selected { COLOR_SELECTED } else { guide_style.fg.unwrap_or(COLOR_BORDER) };
+
+                for ch in guide_str.chars() {
+                    if x >= max_x {
+                        break;
+                    }
+                    if let Some(cell) = frame.buffer.get_mut(x, y) {
+                        cell.fg = gfg;
+                        cell.content = CellContent::from_char(ch);
+                    }
+                    x += 1;
+                }
+            }
+
+            // Draw the label.
+            let bold = is_selected || (node.depth == 0 && node.is_dir);
+            for ch in node.label.chars() {
+                if x >= max_x {
+                    break;
+                }
+                if let Some(cell) = frame.buffer.get_mut(x, y) {
+                    cell.fg = label_fg;
+                    cell.content = CellContent::from_char(ch);
+                    if bold {
+                        let flags = cell.attrs.flags() | StyleFlags::BOLD;
+                        cell.attrs = cell.attrs.with_flags(flags);
+                    }
+                }
+                x += 1;
             }
         }
     }
