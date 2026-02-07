@@ -379,23 +379,97 @@ fn is_markdown_file(path: &Path) -> bool {
     )
 }
 
-/// Read file content for preview (capped at MAX_PREVIEW_BYTES).
-fn read_file_preview(path: &Path) -> Result<String, String> {
-    let metadata = fs::metadata(path).map_err(|e| format!("Cannot read: {e}"))?;
-    if metadata.len() > MAX_PREVIEW_BYTES {
-        let content = fs::read(path).map_err(|e| format!("Cannot read: {e}"))?;
-        let truncated = &content[..MAX_PREVIEW_BYTES as usize];
-        let truncated_str = String::from_utf8(truncated.to_vec())
-            .unwrap_or_else(|_| String::from_utf8_lossy(truncated).into_owned());
-        Ok(format!("{truncated_str}\n\n--- (truncated at 256KB) ---"))
-    } else {
-        fs::read_to_string(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidData {
-                "Binary file (cannot preview)".to_string()
+/// Size of the prefix sample used for binary detection.
+const BINARY_DETECT_BYTES: usize = 8192;
+
+/// Fraction of non-text bytes (excluding valid UTF-8 continuation) that
+/// triggers binary classification when no null byte is present.
+const BINARY_RATIO_THRESHOLD: f64 = 0.30;
+
+/// Detect whether a byte slice looks like binary data.
+///
+/// Heuristics (same approach as `git` and `file(1)`):
+/// 1. Any null byte (`\0`) → binary (catches ELF, Mach-O, images, archives).
+/// 2. High ratio of non-text bytes → binary. "Text" bytes are printable
+///    ASCII (`0x20..=0x7E`), tab (`0x09`), newline (`0x0A`), carriage
+///    return (`0x0D`), and valid UTF-8 continuation bytes (`0x80..=0xBF`
+///    when preceded by a valid lead byte — approximated here by accepting
+///    all high bytes, since we later validate via `String::from_utf8`).
+fn is_binary_data(sample: &[u8]) -> bool {
+    if sample.is_empty() {
+        return false;
+    }
+
+    let mut non_text: usize = 0;
+    for &b in sample {
+        if b == 0 {
+            return true; // Null byte — binary.
+        }
+        let is_text = matches!(b, 0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0x80..=0xFF);
+        if !is_text {
+            non_text += 1;
+        }
+    }
+
+    (non_text as f64 / sample.len() as f64) > BINARY_RATIO_THRESHOLD
+}
+
+/// Replace raw control characters that can corrupt terminal rendering.
+///
+/// Keeps `\n`, `\r`, `\t` (the only controls with sane visual semantics).
+/// Everything else in `0x00..0x1F` and `0x7F` is replaced with the Unicode
+/// replacement character so the preview pane stays clean.
+fn sanitize_control_chars(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                '\u{FFFD}'
             } else {
-                format!("Cannot read: {e}")
+                c
             }
         })
+        .collect()
+}
+
+/// Read file content for preview (capped at `MAX_PREVIEW_BYTES`).
+///
+/// Pipeline:
+/// 1. Read raw bytes (up to `MAX_PREVIEW_BYTES`).
+/// 2. Run binary detection on the first `BINARY_DETECT_BYTES`.
+/// 3. Decode as UTF-8 (reject if invalid).
+/// 4. Sanitize stray control characters.
+fn read_file_preview(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|e| format!("Cannot read: {e}"))?;
+    let file_len = metadata.len();
+
+    // Step 1: Read raw bytes.
+    let raw = fs::read(path).map_err(|e| format!("Cannot read: {e}"))?;
+
+    // Step 2: Binary detection on a prefix sample.
+    let sample_end = raw.len().min(BINARY_DETECT_BYTES);
+    if is_binary_data(&raw[..sample_end]) {
+        return Err("Binary file (cannot preview)".to_string());
+    }
+
+    // Step 3: Determine if we need to truncate, then decode as UTF-8.
+    let truncated = file_len > MAX_PREVIEW_BYTES;
+    let usable = if truncated {
+        &raw[..MAX_PREVIEW_BYTES as usize]
+    } else {
+        &raw
+    };
+
+    let text = String::from_utf8(usable.to_vec()).map_err(|_| {
+        "Binary file (cannot preview)".to_string()
+    })?;
+
+    // Step 4: Sanitize control characters.
+    let clean = sanitize_control_chars(&text);
+
+    if truncated {
+        Ok(format!("{clean}\n\n--- (truncated at 256KB) ---"))
+    } else {
+        Ok(clean)
     }
 }
 
@@ -1549,6 +1623,149 @@ mod tests {
         // Rows after the short tree should be empty.
         let row5 = row_text(&frame, 5, 40);
         assert_eq!(row5, "", "row 5 should be empty after short tree render: got '{row5}'");
+    }
+
+    // =======================================================================
+    // REGRESSION TESTS: Binary Detection & Control Character Sanitization
+    // =======================================================================
+
+    #[test]
+    fn binary_detect_null_bytes() {
+        // Any null byte should trigger binary detection.
+        assert!(is_binary_data(b"hello\x00world"));
+        assert!(is_binary_data(b"\x00"));
+        assert!(is_binary_data(&[0u8; 100]));
+    }
+
+    #[test]
+    fn binary_detect_elf_header() {
+        // ELF magic: \x7fELF followed by binary metadata.
+        let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        elf.extend_from_slice(&[0u8; 56]); // padding with nulls
+        assert!(is_binary_data(&elf));
+    }
+
+    #[test]
+    fn binary_detect_high_non_text_ratio() {
+        // A buffer dominated by control chars (no null) should be binary.
+        let mostly_ctrl: Vec<u8> = (0..100).map(|i| (i % 31) as u8 + 1).collect();
+        // This contains bytes 0x01..0x1F cycling — many are non-text.
+        assert!(
+            is_binary_data(&mostly_ctrl),
+            "high ratio of control bytes should be detected as binary"
+        );
+    }
+
+    #[test]
+    fn binary_detect_normal_text_passes() {
+        assert!(!is_binary_data(b"Hello, world!\nThis is plain text.\n"));
+        assert!(!is_binary_data(b"fn main() {\n    println!(\"hi\");\n}\n"));
+        assert!(!is_binary_data(b""));
+    }
+
+    #[test]
+    fn binary_detect_utf8_text_passes() {
+        // UTF-8 with non-ASCII characters should NOT be classified as binary.
+        let utf8 = "Héllo wörld! 日本語テスト — ñ ü ö ä".as_bytes();
+        assert!(
+            !is_binary_data(utf8),
+            "valid UTF-8 non-ASCII text should not be binary"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        let input = "hello\x01world\x07test\x1b[31m";
+        let clean = sanitize_control_chars(input);
+        assert!(
+            !clean.contains('\x01'),
+            "SOH should be replaced"
+        );
+        assert!(
+            !clean.contains('\x07'),
+            "BEL should be replaced"
+        );
+        assert!(
+            !clean.contains('\x1b'),
+            "ESC should be replaced"
+        );
+        assert!(clean.contains("hello"), "text preserved");
+        assert!(clean.contains("world"), "text preserved");
+    }
+
+    #[test]
+    fn sanitize_keeps_newlines_tabs() {
+        let input = "line1\nline2\r\nindented\there";
+        let clean = sanitize_control_chars(input);
+        assert_eq!(clean, input, "\\n, \\r, \\t should be preserved");
+    }
+
+    #[test]
+    fn read_file_preview_rejects_binary() {
+        let dir = std::env::temp_dir().join("ftui_test_binary_preview");
+        let _ = fs::create_dir_all(&dir);
+
+        // Write a fake binary file (ELF-like header with null bytes).
+        let bin_path = dir.join("test.bin");
+        let mut data = vec![0x7f, b'E', b'L', b'F'];
+        data.extend_from_slice(&[0u8; 200]);
+        data.extend_from_slice(b"some text mixed in");
+        let _ = fs::write(&bin_path, &data);
+
+        let result = read_file_preview(&bin_path);
+        assert!(
+            result.is_err(),
+            "binary file should be rejected: got {:?}",
+            result
+        );
+        assert!(
+            result.unwrap_err().contains("Binary"),
+            "error message should mention binary"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_preview_accepts_text() {
+        let dir = std::env::temp_dir().join("ftui_test_text_preview");
+        let _ = fs::create_dir_all(&dir);
+
+        let txt_path = dir.join("test.txt");
+        let _ = fs::write(&txt_path, "Hello, world!\nLine 2\nLine 3\n");
+
+        let result = read_file_preview(&txt_path);
+        assert!(result.is_ok(), "text file should be accepted");
+        let content = result.unwrap();
+        assert!(content.contains("Hello, world!"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_preview_sanitizes_control_chars() {
+        let dir = std::env::temp_dir().join("ftui_test_ctrl_preview");
+        let _ = fs::create_dir_all(&dir);
+
+        // Write a text file with embedded control characters.
+        let txt_path = dir.join("dirty.txt");
+        let _ = fs::write(&txt_path, "clean\x07bell\x1bescape\n");
+
+        let result = read_file_preview(&txt_path);
+        assert!(result.is_ok(), "text file with control chars should be accepted");
+        let content = result.unwrap();
+        assert!(
+            !content.contains('\x07'),
+            "BEL should be sanitized out"
+        );
+        assert!(
+            !content.contains('\x1b'),
+            "ESC should be sanitized out"
+        );
+        assert!(content.contains("clean"), "text preserved");
+        assert!(content.contains('\n'), "newlines preserved");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
