@@ -69,3 +69,20 @@ jobs:
         with:
           files: artifacts/**/*
           generate_release_notes: true
+          body: |
+            ## Install
+
+            ```bash
+            curl -sSf https://raw.githubusercontent.com/l0g1x/terminal/main/install.sh | bash
+            ```
+
+            Detects your platform, downloads the right binary, and installs to `~/.cargo/bin/terminal`.
+
+            ### Pre-built binaries
+
+            | File | Platform |
+            |------|----------|
+            | `terminal-linux-x86_64` | Linux (Intel/AMD) |
+            | `terminal-linux-aarch64` | Linux (ARM64) |
+            | `terminal-darwin-x86_64` | macOS (Intel) |
+            | `terminal-darwin-aarch64` | macOS (Apple Silicon) |
