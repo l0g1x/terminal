@@ -255,44 +255,15 @@ impl From<Event> for Msg {
 // Filesystem helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `TreeNode` hierarchy from a directory path.
-/// Only reads one level deep (lazy expansion).
+/// Build a stub `TreeNode` for a path. Does NOT read directory contents.
+/// Children are loaded lazily by `reload_children` when the user expands.
 fn build_tree_node(path: &Path) -> TreeNode {
     let name = path
         .file_name()
         .map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
 
     if path.is_dir() {
-        let mut node = TreeNode::new(format!("{name}/")).with_expanded(false);
-        if let Ok(entries) = fs::read_dir(path) {
-            let mut dirs: Vec<PathBuf> = Vec::new();
-            let mut files: Vec<PathBuf> = Vec::new();
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.file_name()
-                    .map_or(false, |n| n.to_string_lossy().starts_with('.'))
-                {
-                    continue;
-                }
-                if p.is_dir() {
-                    dirs.push(p);
-                } else {
-                    files.push(p);
-                }
-            }
-            dirs.sort();
-            files.sort();
-            for d in &dirs {
-                node = node.child(build_tree_node(d));
-            }
-            for f in &files {
-                let fname = f
-                    .file_name()
-                    .map_or_else(|| f.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
-                node = node.child(TreeNode::new(fname).with_expanded(false));
-            }
-        }
-        node
+        TreeNode::new(format!("{name}/")).with_expanded(false)
     } else {
         TreeNode::new(name).with_expanded(false)
     }
@@ -324,7 +295,10 @@ fn reload_children(node: &mut TreeNode, path: &Path) {
     files.sort();
     let mut children = Vec::new();
     for d in &dirs {
-        children.push(build_tree_node(d));
+        let dname = d
+            .file_name()
+            .map_or_else(|| d.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        children.push(TreeNode::new(format!("{dname}/")).with_expanded(false));
     }
     for f in &files {
         let fname = f
@@ -956,9 +930,17 @@ $$
         let _ = fs::write(dir.join("readme.md"), "# Test");
         let _ = fs::write(dir.join(".hidden"), "secret");
 
-        let node = build_tree_node(&dir);
+        // build_tree_node returns a stub -- reload_children populates it.
+        let mut node = build_tree_node(&dir);
         assert!(node.label().ends_with('/'));
+        assert!(node.children().is_empty(), "stub should have no children");
+
+        reload_children(&mut node, &dir);
         let child_labels: Vec<&str> = node.children().iter().map(|c| c.label()).collect();
+        assert!(
+            !child_labels.is_empty(),
+            "reload_children should populate children"
+        );
         assert!(
             !child_labels.iter().any(|l| l.starts_with('.')),
             "hidden files should be excluded: {child_labels:?}"
