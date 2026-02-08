@@ -1,2 +1,5 @@
 /target
 terminal-linux-x86_64
+
+# bv (beads viewer) local config and caches
+.bv/
