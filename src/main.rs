@@ -44,8 +44,7 @@ const MAX_PREVIEW_BYTES: u64 = 256 * 1024;
 const BUILD_HASH: &str = env!("BUILD_GIT_HASH");
 
 /// GitHub API endpoint for the latest commit on main.
-const GITHUB_API_URL: &str =
-    "https://api.github.com/repos/l0g1x/terminal/commits/main";
+const GITHUB_API_URL: &str = "https://api.github.com/repos/l0g1x/terminal/commits/main";
 
 /// How often to check for updates (24 hours).
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(86_400);
@@ -102,9 +101,12 @@ fn check_for_update() -> Option<String> {
     let output = Command::new("curl")
         .args([
             "-sSf",
-            "--max-time", "5",
-            "-H", "User-Agent: terminal-file-browser",
-            "-H", "Accept: application/vnd.github.v3+json",
+            "--max-time",
+            "5",
+            "-H",
+            "User-Agent: terminal-file-browser",
+            "-H",
+            "Accept: application/vnd.github.v3+json",
             GITHUB_API_URL,
         ])
         .output()
@@ -263,9 +265,10 @@ impl From<Event> for Msg {
 /// Build a stub `TreeNode` for a path. Does NOT read directory contents.
 /// Children are loaded lazily by `reload_children` when the user expands.
 fn build_tree_node(path: &Path) -> TreeNode {
-    let name = path
-        .file_name()
-        .map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || path.to_string_lossy().into_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
 
     if path.is_dir() {
         TreeNode::new(format!("{name}/")).with_expanded(false)
@@ -300,15 +303,17 @@ fn reload_children(node: &mut TreeNode, path: &Path) {
     files.sort();
     let mut children = Vec::new();
     for d in &dirs {
-        let dname = d
-            .file_name()
-            .map_or_else(|| d.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let dname = d.file_name().map_or_else(
+            || d.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         children.push(TreeNode::new(format!("{dname}/")).with_expanded(false));
     }
     for f in &files {
-        let fname = f
-            .file_name()
-            .map_or_else(|| f.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let fname = f.file_name().map_or_else(
+            || f.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         children.push(TreeNode::new(fname).with_expanded(false));
     }
     let label = node.label().to_string();
@@ -320,9 +325,19 @@ fn reload_children(node: &mut TreeNode, path: &Path) {
 
 /// Given a visible index in the tree, resolve the filesystem path.
 /// Uses a pre-allocated scratch buffer to avoid allocations.
-fn resolve_path_for_index(root: &Path, tree: &Tree, index: usize, scratch: &mut Vec<String>) -> Option<PathBuf> {
+fn resolve_path_for_index(
+    root: &Path,
+    tree: &Tree,
+    index: usize,
+    scratch: &mut Vec<String>,
+) -> Option<PathBuf> {
     scratch.clear();
-    if collect_path_at_index(tree.root(), index, scratch, tree.root().label().ends_with('/')) {
+    if collect_path_at_index(
+        tree.root(),
+        index,
+        scratch,
+        tree.root().label().ends_with('/'),
+    ) {
         let mut full_path = root.to_path_buf();
         for part in &scratch[1..] {
             let clean = part.trim_end_matches('/');
@@ -414,21 +429,56 @@ fn is_binary_data(sample: &[u8]) -> bool {
     (non_text as f64 / sample.len() as f64) > BINARY_RATIO_THRESHOLD
 }
 
-/// Replace raw control characters that can corrupt terminal rendering.
+/// Tab width used when expanding `\t` to spaces.
+const TAB_WIDTH: usize = 4;
+
+/// Sanitize file content for safe rendering in FrankenTUI.
 ///
-/// Keeps `\n`, `\r`, `\t` (the only controls with sane visual semantics).
-/// Everything else in `0x00..0x1F` and `0x7F` is replaced with the Unicode
-/// replacement character so the preview pane stays clean.
-fn sanitize_control_chars(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
-                '\u{FFFD}'
-            } else {
-                c
+/// FrankenTUI allocates exactly 1 cell per character with no special
+/// handling for control codes. The terminal, however, interprets `\t` as
+/// "advance to next tab stop" and `\r` as "move cursor to column 0",
+/// causing a mismatch between the buffer model and the actual cursor
+/// position. This corrupts every character that follows on the same line.
+///
+/// Transformations applied per line:
+/// - **Tabs** are expanded to spaces (aligned to `TAB_WIDTH` boundaries).
+/// - **Carriage returns** (`\r`) are stripped.
+/// - **Other control chars** (`0x00..0x1F` except `\n`, and `0x7F`) are
+///   replaced with the Unicode replacement character `U+FFFD`.
+/// - **Newlines** (`\n`) are preserved (they are line separators in
+///   `Text::raw`).
+fn sanitize_for_display(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut col: usize = 0;
+
+    for c in text.chars() {
+        match c {
+            '\t' => {
+                // Expand to next TAB_WIDTH boundary.
+                let spaces = TAB_WIDTH - (col % TAB_WIDTH);
+                for _ in 0..spaces {
+                    out.push(' ');
+                }
+                col += spaces;
             }
-        })
-        .collect()
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            '\r' => {
+                // Strip carriage returns entirely.
+            }
+            c if c.is_control() => {
+                out.push('\u{FFFD}');
+                col += 1;
+            }
+            c => {
+                out.push(c);
+                col += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Read file content for preview (capped at `MAX_PREVIEW_BYTES`).
@@ -459,12 +509,11 @@ fn read_file_preview(path: &Path) -> Result<String, String> {
         &raw
     };
 
-    let text = String::from_utf8(usable.to_vec()).map_err(|_| {
-        "Binary file (cannot preview)".to_string()
-    })?;
+    let text = String::from_utf8(usable.to_vec())
+        .map_err(|_| "Binary file (cannot preview)".to_string())?;
 
-    // Step 4: Sanitize control characters.
-    let clean = sanitize_control_chars(&text);
+    // Step 4: Sanitize for display (expand tabs, strip \r, replace controls).
+    let clean = sanitize_for_display(&text);
 
     if truncated {
         Ok(format!("{clean}\n\n--- (truncated at 256KB) ---"))
@@ -502,9 +551,10 @@ impl FileBrowser {
             .with_root_style(Style::new().fg(COLOR_DIR).bold())
             .hit_id(TREE_HIT_ID);
 
-        let root_name = root
-            .file_name()
-            .map_or_else(|| root.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let root_name = root.file_name().map_or_else(
+            || root.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
 
         Self {
             root,
@@ -519,7 +569,9 @@ impl FileBrowser {
             preview_scroll: 0,
             preview_height: Cell::new(0),
             focus: Pane::Tree,
-            status: format!("  {root_name}/ | arrows: navigate | Enter: open | Tab: switch pane | q: quit"),
+            status: format!(
+                "  {root_name}/ | arrows: navigate | Enter: open | Tab: switch pane | q: quit"
+            ),
             preview_title: " Preview ".to_string(),
             md_renderer: MarkdownRenderer::new(MarkdownTheme::default()),
             scrollbar_state: ScrollbarState::new(0, 0, 0),
@@ -536,7 +588,12 @@ impl FileBrowser {
         if self.cached_path_index == self.selected_index {
             return self.cached_path.clone();
         }
-        let path = resolve_path_for_index(&self.root, &self.tree, self.selected_index, &mut self.path_scratch);
+        let path = resolve_path_for_index(
+            &self.root,
+            &self.tree,
+            self.selected_index,
+            &mut self.path_scratch,
+        );
         self.cached_path = path.clone();
         self.cached_path_index = self.selected_index;
         path
@@ -553,9 +610,10 @@ impl FileBrowser {
         let size_str = fs::metadata(&path)
             .map(|m| human_size(m.len()))
             .unwrap_or_else(|_| "?".into());
-        let name = path
-            .file_name()
-            .map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let name = path.file_name().map_or_else(
+            || path.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         self.status = format!("  {name} | {size_str} | Tab: switch pane | q: quit");
         self.is_markdown = is_markdown_file(&path);
 
@@ -630,9 +688,10 @@ impl FileBrowser {
                 self.select_file(path);
             } else {
                 // Directory -- show basic info without expensive fs::read_dir count
-                let name = path
-                    .file_name()
-                    .map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+                let name = path.file_name().map_or_else(
+                    || path.to_string_lossy().into_owned(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
                 self.status = format!("  {name}/ | Enter: expand | q: quit");
                 self.selected_file = None;
                 self.preview_title = " Preview ".to_string();
@@ -758,8 +817,7 @@ impl Model for FileBrowser {
                 }
                 KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
                     if self.focus == Pane::Tree {
-                        if let Some(node) =
-                            self.tree.node_at_visible_index_mut(self.selected_index)
+                        if let Some(node) = self.tree.node_at_visible_index_mut(self.selected_index)
                         {
                             if node.is_expanded() && !node.children().is_empty() {
                                 node.toggle_expanded();
@@ -787,9 +845,11 @@ impl Model for FileBrowser {
 
             Msg::Mouse(me) => match me.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    let result =
-                        self.tree
-                            .handle_mouse(&me, Some((TREE_HIT_ID, HitRegion::Content, 0)), TREE_HIT_ID);
+                    let result = self.tree.handle_mouse(
+                        &me,
+                        Some((TREE_HIT_ID, HitRegion::Content, 0)),
+                        TREE_HIT_ID,
+                    );
                     match result {
                         MouseResult::Selected(idx) | MouseResult::Activated(idx) => {
                             self.selected_index = idx;
@@ -933,7 +993,10 @@ impl Model for FileBrowser {
             self.status.as_str()
         };
         let status_style = if self.update_notice.is_some() {
-            Style::new().fg(PackedRgba::rgb(255, 200, 60)).bg(COLOR_STATUS_BG).bold()
+            Style::new()
+                .fg(PackedRgba::rgb(255, 200, 60))
+                .bg(COLOR_STATUS_BG)
+                .bold()
         } else {
             self.styles.status_style
         };
@@ -1022,7 +1085,9 @@ impl FileBrowser {
         let scroll = self.tree_scroll;
         let end = (scroll + viewport_h).min(flat.len());
 
-        let selected = self.selected_index.min(self.visible_count.saturating_sub(1));
+        let selected = self
+            .selected_index
+            .min(self.visible_count.saturating_sub(1));
 
         for (row_idx, flat_idx) in (scroll..end).enumerate() {
             let node = &flat[flat_idx];
@@ -1033,7 +1098,11 @@ impl FileBrowser {
             let is_selected = flat_idx == selected;
 
             // Determine colors for this row.
-            let guide_fg = if is_selected { COLOR_SELECTED } else { COLOR_BORDER };
+            let guide_fg = if is_selected {
+                COLOR_SELECTED
+            } else {
+                COLOR_BORDER
+            };
             let label_fg = if is_selected {
                 COLOR_SELECTED
             } else if node.is_dir {
@@ -1066,7 +1135,9 @@ impl FileBrowser {
                     }
                 };
 
-                x = frame.buffer.print_text_clipped(x, y, guide_str, guide_cell, max_x);
+                x = frame
+                    .buffer
+                    .print_text_clipped(x, y, guide_str, guide_cell, max_x);
             }
 
             // Build a base cell for the label.
@@ -1081,7 +1152,9 @@ impl FileBrowser {
                 .with_attrs(label_attrs);
 
             // Draw the label using print_text_clipped.
-            frame.buffer.print_text_clipped(x, y, node.label, label_cell, max_x);
+            frame
+                .buffer
+                .print_text_clipped(x, y, node.label, label_cell, max_x);
         }
     }
 }
@@ -1115,7 +1188,10 @@ mod tests {
 
     /// Helper: extract the fg color at (x, y).
     fn fg_at(frame: &Frame, x: u16, y: u16) -> PackedRgba {
-        frame.buffer.get(x, y).map_or(PackedRgba::TRANSPARENT, |c| c.fg)
+        frame
+            .buffer
+            .get(x, y)
+            .map_or(PackedRgba::TRANSPARENT, |c| c.fg)
     }
 
     /// Find the column index of the first occurrence of `needle` in a row string.
@@ -1136,10 +1212,11 @@ mod tests {
     // Helper: create a FileBrowser with a synthetic in-memory tree.
     // -----------------------------------------------------------------------
     fn make_test_browser(nodes: Vec<TreeNode>, selected: usize, scroll: usize) -> FileBrowser {
-        let root_node = nodes.into_iter().fold(
-            TreeNode::new("root/").with_expanded(true),
-            |root, child| root.child(child),
-        );
+        let root_node = nodes
+            .into_iter()
+            .fold(TreeNode::new("root/").with_expanded(true), |root, child| {
+                root.child(child)
+            });
         let visible = root_node.visible_count();
         let tree = Tree::new(root_node)
             .with_show_root(true)
@@ -1264,10 +1341,7 @@ mod tests {
     fn render_tree_guide_characters() {
         // Verify that guide characters are correct (├── for non-last, ╰── for last).
         let browser = make_test_browser(
-            vec![
-                TreeNode::new("first.txt"),
-                TreeNode::new("last.txt"),
-            ],
+            vec![TreeNode::new("first.txt"), TreeNode::new("last.txt")],
             0,
             0,
         );
@@ -1298,9 +1372,7 @@ mod tests {
             vec![
                 TreeNode::new("dir/")
                     .with_expanded(true)
-                    .with_children(vec![
-                        TreeNode::new("inner.txt"),
-                    ]),
+                    .with_children(vec![TreeNode::new("inner.txt")]),
                 TreeNode::new("other.txt"),
             ],
             0,
@@ -1331,10 +1403,7 @@ mod tests {
     fn render_tree_selection_color() {
         // Verify the selected row gets COLOR_SELECTED for its label fg.
         let browser = make_test_browser(
-            vec![
-                TreeNode::new("file_a.txt"),
-                TreeNode::new("file_b.txt"),
-            ],
+            vec![TreeNode::new("file_a.txt"), TreeNode::new("file_b.txt")],
             2, // select file_b.txt (index 0=root, 1=file_a, 2=file_b)
             0,
         );
@@ -1366,10 +1435,7 @@ mod tests {
         let (_rows, _fgs, bolds) = render_tree_detailed(&browser, 40, 5);
 
         // Row 1 is selected.txt. Guides are 4 chars wide, label starts at col 4.
-        assert!(
-            bolds[1][4],
-            "selected row label should be bold at col 4"
-        );
+        assert!(bolds[1][4], "selected row label should be bold at col 4");
         // Row 0 is root/ which is also bold (depth 0 + is_dir).
         assert!(bolds[0][0], "root label should be bold");
     }
@@ -1514,10 +1580,7 @@ mod tests {
             .with_children(vec![
                 TreeNode::new("dir/")
                     .with_expanded(true)
-                    .with_children(vec![
-                        TreeNode::new("a.txt"),
-                        TreeNode::new("b.txt"),
-                    ]),
+                    .with_children(vec![TreeNode::new("a.txt"), TreeNode::new("b.txt")]),
                 TreeNode::new("c.txt"),
             ]);
         let flat = flatten_visible(&root, true);
@@ -1536,9 +1599,7 @@ mod tests {
             .with_children(vec![
                 TreeNode::new("collapsed_dir/")
                     .with_expanded(false)
-                    .with_children(vec![
-                        TreeNode::new("hidden.txt"),
-                    ]),
+                    .with_children(vec![TreeNode::new("hidden.txt")]),
                 TreeNode::new("visible.txt"),
             ]);
         let flat = flatten_visible(&root, true);
@@ -1554,11 +1615,11 @@ mod tests {
     fn flatten_visible_deeply_nested() {
         let root = TreeNode::new("root/")
             .with_expanded(true)
-            .with_children(vec![TreeNode::new("a/")
-                .with_expanded(true)
-                .with_children(vec![TreeNode::new("b/")
+            .with_children(vec![TreeNode::new("a/").with_expanded(true).with_children(
+                vec![TreeNode::new("b/")
                     .with_expanded(true)
-                    .with_children(vec![TreeNode::new("c.txt")])])]);
+                    .with_children(vec![TreeNode::new("c.txt")])],
+            )]);
 
         let flat = flatten_visible(&root, true);
         assert_eq!(flat.len(), 4);
@@ -1601,7 +1662,9 @@ mod tests {
 
         // First render: tree with many items.
         let browser1 = make_test_browser(
-            (0..8).map(|i| TreeNode::new(format!("file_{i}.txt"))).collect(),
+            (0..8)
+                .map(|i| TreeNode::new(format!("file_{i}.txt")))
+                .collect(),
             0,
             0,
         );
@@ -1612,17 +1675,16 @@ mod tests {
 
         // Second render: tree with only 2 items, into the SAME frame after clear.
         frame.buffer.fill(area, RenderCell::default());
-        let browser2 = make_test_browser(
-            vec![TreeNode::new("only.txt")],
-            0,
-            0,
-        );
+        let browser2 = make_test_browser(vec![TreeNode::new("only.txt")], 0, 0);
         browser2.tree_height.set(10);
         browser2.render_tree_with_selection(area, &mut frame);
 
         // Rows after the short tree should be empty.
         let row5 = row_text(&frame, 5, 40);
-        assert_eq!(row5, "", "row 5 should be empty after short tree render: got '{row5}'");
+        assert_eq!(
+            row5, "",
+            "row 5 should be empty after short tree render: got '{row5}'"
+        );
     }
 
     // =======================================================================
@@ -1676,28 +1738,78 @@ mod tests {
     #[test]
     fn sanitize_strips_control_chars() {
         let input = "hello\x01world\x07test\x1b[31m";
-        let clean = sanitize_control_chars(input);
-        assert!(
-            !clean.contains('\x01'),
-            "SOH should be replaced"
-        );
-        assert!(
-            !clean.contains('\x07'),
-            "BEL should be replaced"
-        );
-        assert!(
-            !clean.contains('\x1b'),
-            "ESC should be replaced"
-        );
+        let clean = sanitize_for_display(input);
+        assert!(!clean.contains('\x01'), "SOH should be replaced");
+        assert!(!clean.contains('\x07'), "BEL should be replaced");
+        assert!(!clean.contains('\x1b'), "ESC should be replaced");
         assert!(clean.contains("hello"), "text preserved");
         assert!(clean.contains("world"), "text preserved");
     }
 
     #[test]
-    fn sanitize_keeps_newlines_tabs() {
-        let input = "line1\nline2\r\nindented\there";
-        let clean = sanitize_control_chars(input);
-        assert_eq!(clean, input, "\\n, \\r, \\t should be preserved");
+    fn sanitize_expands_tabs_to_spaces() {
+        // Tab at column 0 should expand to TAB_WIDTH spaces.
+        let input = "\thello";
+        let clean = sanitize_for_display(input);
+        assert_eq!(clean, "    hello", "tab at col 0 -> 4 spaces");
+
+        // Tab after 2 chars should expand to 2 spaces (next 4-col boundary).
+        let input2 = "ab\tcd";
+        let clean2 = sanitize_for_display(input2);
+        assert_eq!(clean2, "ab  cd", "tab at col 2 -> 2 spaces to col 4");
+
+        // Tab after 4 chars should expand to 4 spaces (next boundary).
+        let input3 = "abcd\tx";
+        let clean3 = sanitize_for_display(input3);
+        assert_eq!(clean3, "abcd    x", "tab at col 4 -> 4 spaces to col 8");
+
+        // Multiple tabs.
+        let input4 = "\t\tindented";
+        let clean4 = sanitize_for_display(input4);
+        assert_eq!(clean4, "        indented", "two tabs -> 8 spaces");
+    }
+
+    #[test]
+    fn sanitize_expands_tabs_makefile_style() {
+        // Typical Makefile: recipe lines start with a tab.
+        let input = "all: build\n\tgcc -o main main.c\n\techo done\n";
+        let clean = sanitize_for_display(input);
+        assert!(!clean.contains('\t'), "no literal tabs should remain");
+        assert!(clean.contains("    gcc -o main main.c"), "tab expanded");
+        assert!(clean.contains("    echo done"), "tab expanded");
+    }
+
+    #[test]
+    fn sanitize_strips_carriage_returns() {
+        // Windows line endings.
+        let input = "line1\r\nline2\r\nline3\r\n";
+        let clean = sanitize_for_display(input);
+        assert!(!clean.contains('\r'), "\\r should be stripped");
+        assert_eq!(clean, "line1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn sanitize_strips_bare_carriage_returns() {
+        // Progress-bar style output with bare \r.
+        let input = "progress: 50%\rprogress: 100%\n";
+        let clean = sanitize_for_display(input);
+        assert!(!clean.contains('\r'), "bare \\r should be stripped");
+        assert!(clean.contains("progress: 50%"));
+    }
+
+    #[test]
+    fn sanitize_preserves_newlines() {
+        let input = "line1\nline2\nline3";
+        let clean = sanitize_for_display(input);
+        assert_eq!(clean, input, "newlines should be preserved");
+    }
+
+    #[test]
+    fn sanitize_tab_column_resets_on_newline() {
+        // Tab column tracking must reset after \n.
+        let input = "abc\n\tx";
+        let clean = sanitize_for_display(input);
+        assert_eq!(clean, "abc\n    x", "tab column resets after newline");
     }
 
     #[test]
@@ -1752,18 +1864,55 @@ mod tests {
         let _ = fs::write(&txt_path, "clean\x07bell\x1bescape\n");
 
         let result = read_file_preview(&txt_path);
-        assert!(result.is_ok(), "text file with control chars should be accepted");
+        assert!(
+            result.is_ok(),
+            "text file with control chars should be accepted"
+        );
         let content = result.unwrap();
-        assert!(
-            !content.contains('\x07'),
-            "BEL should be sanitized out"
-        );
-        assert!(
-            !content.contains('\x1b'),
-            "ESC should be sanitized out"
-        );
+        assert!(!content.contains('\x07'), "BEL should be sanitized out");
+        assert!(!content.contains('\x1b'), "ESC should be sanitized out");
         assert!(content.contains("clean"), "text preserved");
         assert!(content.contains('\n'), "newlines preserved");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_preview_expands_tabs_in_makefile() {
+        let dir = std::env::temp_dir().join("ftui_test_makefile_preview");
+        let _ = fs::create_dir_all(&dir);
+
+        let makefile_path = dir.join("Makefile");
+        let _ = fs::write(
+            &makefile_path,
+            "all: build\n\tgcc -o main main.c\n\t@echo done\n",
+        );
+
+        let result = read_file_preview(&makefile_path);
+        assert!(result.is_ok(), "Makefile should be readable");
+        let content = result.unwrap();
+        assert!(!content.contains('\t'), "tabs should be expanded");
+        assert!(
+            content.contains("    gcc -o main main.c"),
+            "tab -> 4 spaces"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_preview_strips_windows_crlf() {
+        let dir = std::env::temp_dir().join("ftui_test_crlf_preview");
+        let _ = fs::create_dir_all(&dir);
+
+        let path = dir.join("windows.txt");
+        let _ = fs::write(&path, "line1\r\nline2\r\nline3\r\n");
+
+        let result = read_file_preview(&path);
+        assert!(result.is_ok());
+        let content = result.unwrap();
+        assert!(!content.contains('\r'), "\\r should be stripped");
+        assert_eq!(content, "line1\nline2\nline3\n");
 
         let _ = fs::remove_dir_all(&dir);
     }
