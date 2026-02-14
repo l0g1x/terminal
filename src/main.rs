@@ -1121,14 +1121,16 @@ impl Model for FileBrowser {
                     }
                 }
                 MouseEventKind::ScrollUp => {
-                    if self.focus == Pane::Preview {
+                    // Scroll based on mouse position, not focus
+                    if self.is_in_preview_area(me.x, me.y) {
                         self.scroll_preview_up(3);
                     } else {
                         self.move_selection_by(-1);
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    if self.focus == Pane::Preview {
+                    // Scroll based on mouse position, not focus
+                    if self.is_in_preview_area(me.x, me.y) {
                         self.scroll_preview_down(3);
                     } else {
                         self.move_selection_by(1);
