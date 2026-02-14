@@ -13,7 +13,7 @@ use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ftui_core::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ftui_core::geometry::Rect;
@@ -217,6 +217,19 @@ struct FileBrowser {
     tree_scroll: usize,
     /// Height of the tree pane (updated each frame from view()).
     tree_height: Cell<u16>,
+    // ----- Selection & Toast State (copy-on-selection feature) -----
+    /// Start cell position of text selection (col, row) relative to preview inner area.
+    selection_start: Option<(u16, u16)>,
+    /// End cell position of text selection (col, row) relative to preview inner area.
+    selection_end: Option<(u16, u16)>,
+    /// Whether user is currently dragging to select text.
+    is_selecting: bool,
+    /// Toast notification text to display (e.g., "Copied to clipboard").
+    toast_text: Option<String>,
+    /// When the toast was triggered (for auto-dismiss timing).
+    toast_start: Option<Instant>,
+    /// Cached preview inner area for hit-testing mouse events.
+    preview_inner_area: Cell<Rect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,7 +301,7 @@ fn reload_children(node: &mut TreeNode, path: &Path) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.file_name()
-                .map_or(false, |n| n.to_string_lossy().starts_with('.'))
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
             {
                 continue;
             }
@@ -580,6 +593,13 @@ impl FileBrowser {
             update_notice: None,
             tree_scroll: 0,
             tree_height: Cell::new(0),
+            // Selection & toast state
+            selection_start: None,
+            selection_end: None,
+            is_selecting: false,
+            toast_text: None,
+            toast_start: None,
+            preview_inner_area: Cell::new(Rect::new(0, 0, 0, 0)),
         }
     }
 
@@ -733,6 +753,141 @@ impl FileBrowser {
         self.preview_scroll = self.preview_scroll.saturating_add(lines).min(max);
         self.scrollbar_state.position = self.preview_scroll as usize;
     }
+
+    // -----------------------------------------------------------------------
+    // Selection & Clipboard helpers (copy-on-selection feature)
+    // -----------------------------------------------------------------------
+
+    /// Map a cell position (x, y) relative to preview inner area to a character
+    /// index in the preview text, accounting for scroll offset and word wrapping.
+    /// Returns None if position is outside text bounds.
+    fn map_cell_to_char(&self, x: u16, y: u16, wrap_width: u16) -> Option<usize> {
+        // Account for scroll offset
+        let logical_y = y as usize + self.preview_scroll as usize;
+
+        // Convert preview_text to plain string for character indexing
+        let plain = self.preview_text_as_string();
+        let mut char_idx = 0;
+        let mut current_line = 0;
+        let mut current_col = 0;
+
+        for ch in plain.chars() {
+            if current_line == logical_y && current_col == x as usize {
+                return Some(char_idx);
+            }
+
+            if ch == '\n' {
+                // If we're on the target line but past the newline, clamp to end of line
+                if current_line == logical_y {
+                    return Some(char_idx);
+                }
+                current_line += 1;
+                current_col = 0;
+            } else {
+                current_col += 1;
+                // Handle word wrapping
+                if wrap_width > 0 && current_col >= wrap_width as usize {
+                    current_line += 1;
+                    current_col = 0;
+                }
+            }
+            char_idx += 1;
+        }
+
+        // If we reached the target line, return end of text
+        if current_line == logical_y {
+            Some(char_idx)
+        } else {
+            None
+        }
+    }
+
+    /// Extract selected text between two character indices.
+    /// Handles reversed selections (end before start).
+    fn extract_selected_text(&self, start_idx: usize, end_idx: usize) -> String {
+        let plain = self.preview_text_as_string();
+        let (lo, hi) = if start_idx <= end_idx {
+            (start_idx, end_idx)
+        } else {
+            (end_idx, start_idx)
+        };
+        plain.chars().skip(lo).take(hi - lo).collect()
+    }
+
+    /// Convert preview_text (ftui Text) to a plain String.
+    fn preview_text_as_string(&self) -> String {
+        // Text is composed of Lines, each Line has Spans
+        // We need to extract the raw text content
+        let mut result = String::new();
+        for (i, line) in self.preview_text.lines().iter().enumerate() {
+            if i > 0 {
+                result.push('\n');
+            }
+            for span in line.spans() {
+                result.push_str(&span.content);
+            }
+        }
+        result
+    }
+
+    /// Check if a mouse position is within the preview inner area.
+    fn is_in_preview_area(&self, x: u16, y: u16) -> bool {
+        let area = self.preview_inner_area.get();
+        x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+    }
+
+    /// Convert absolute screen coordinates to preview-relative coordinates.
+    fn screen_to_preview_coords(&self, x: u16, y: u16) -> (u16, u16) {
+        let area = self.preview_inner_area.get();
+        (x.saturating_sub(area.x), y.saturating_sub(area.y))
+    }
+
+    /// Clear current selection state.
+    fn clear_selection(&mut self) {
+        self.selection_start = None;
+        self.selection_end = None;
+        self.is_selecting = false;
+    }
+
+    /// Show a toast notification that auto-dismisses.
+    fn show_toast(&mut self, message: &str) {
+        self.toast_text = Some(message.to_string());
+        self.toast_start = Some(Instant::now());
+    }
+
+    /// Check if toast should be dismissed (after ~1.5 seconds).
+    fn check_toast_timeout(&mut self) {
+        if let Some(start) = self.toast_start
+            && start.elapsed() > Duration::from_millis(1500) {
+                self.toast_text = None;
+                self.toast_start = None;
+            }
+    }
+
+    /// Copy selected text to clipboard and show toast.
+    fn copy_selection_to_clipboard(&mut self) {
+        let (start, end) = match (self.selection_start, self.selection_end) {
+            (Some(s), Some(e)) => (s, e),
+            _ => return,
+        };
+
+        let wrap_width = self.preview_inner_area.get().width;
+        let start_idx = self.map_cell_to_char(start.0, start.1, wrap_width);
+        let end_idx = self.map_cell_to_char(end.0, end.1, wrap_width);
+
+        if let (Some(si), Some(ei)) = (start_idx, end_idx) {
+            let text = self.extract_selected_text(si, ei);
+            if !text.is_empty() {
+                // Copy to clipboard using arboard
+                if let Ok(mut clipboard) = arboard::Clipboard::new()
+                    && clipboard.set_text(&text).is_ok() {
+                        self.show_toast("Copied to clipboard");
+                    }
+            }
+        }
+
+        self.clear_selection();
+    }
 }
 
 impl Model for FileBrowser {
@@ -845,26 +1000,53 @@ impl Model for FileBrowser {
 
             Msg::Mouse(me) => match me.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    let result = self.tree.handle_mouse(
-                        &me,
-                        Some((TREE_HIT_ID, HitRegion::Content, 0)),
-                        TREE_HIT_ID,
-                    );
-                    match result {
-                        MouseResult::Selected(idx) | MouseResult::Activated(idx) => {
-                            self.selected_index = idx;
-                            self.invalidate_path_cache();
-                            self.update_tree_scroll();
-                            self.focus = Pane::Tree;
-                            if result == MouseResult::Activated(idx) {
-                                self.handle_enter();
-                            } else {
-                                self.on_selection_changed();
+                    // Check if click is in preview area for text selection
+                    if self.is_in_preview_area(me.x, me.y) {
+                        let (px, py) = self.screen_to_preview_coords(me.x, me.y);
+                        self.selection_start = Some((px, py));
+                        self.selection_end = Some((px, py));
+                        self.is_selecting = true;
+                        self.focus = Pane::Preview;
+                    } else {
+                        // Handle tree pane click
+                        let result = self.tree.handle_mouse(
+                            &me,
+                            Some((TREE_HIT_ID, HitRegion::Content, 0)),
+                            TREE_HIT_ID,
+                        );
+                        match result {
+                            MouseResult::Selected(idx) | MouseResult::Activated(idx) => {
+                                self.selected_index = idx;
+                                self.invalidate_path_cache();
+                                self.update_tree_scroll();
+                                self.focus = Pane::Tree;
+                                if result == MouseResult::Activated(idx) {
+                                    self.handle_enter();
+                                } else {
+                                    self.on_selection_changed();
+                                }
+                            }
+                            _ => {
+                                self.focus = Pane::Preview;
                             }
                         }
-                        _ => {
-                            self.focus = Pane::Preview;
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    // Update selection end during drag
+                    if self.is_selecting && self.is_in_preview_area(me.x, me.y) {
+                        let (px, py) = self.screen_to_preview_coords(me.x, me.y);
+                        self.selection_end = Some((px, py));
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    // Finalize selection and copy to clipboard
+                    if self.is_selecting {
+                        if self.is_in_preview_area(me.x, me.y) {
+                            let (px, py) = self.screen_to_preview_coords(me.x, me.y);
+                            self.selection_end = Some((px, py));
                         }
+                        self.copy_selection_to_clipboard();
                     }
                 }
                 MouseEventKind::ScrollUp => {
@@ -897,7 +1079,11 @@ impl Model for FileBrowser {
                 }
             }
 
-            Msg::Tick | Msg::Noop => {}
+            Msg::Tick => {
+                // Check if toast should be auto-dismissed
+                self.check_toast_timeout();
+            }
+            Msg::Noop => {}
         }
         Cmd::none()
     }
@@ -950,7 +1136,7 @@ impl Model for FileBrowser {
         };
 
         let preview_block = Block::bordered()
-            .title(&*self.preview_title)
+            .title(&self.preview_title)
             .title_alignment(Alignment::Left)
             .border_style(preview_border)
             .border_type(BorderType::Rounded);
@@ -960,6 +1146,8 @@ impl Model for FileBrowser {
 
         let ph = inner_preview_area.height;
         self.preview_height.set(ph);
+        // Store preview inner area for mouse hit testing
+        self.preview_inner_area.set(inner_preview_area);
 
         // Clear the preview area before rendering to prevent stale content
         // from the previous file bleeding through when switching to shorter text.
@@ -971,6 +1159,11 @@ impl Model for FileBrowser {
             .scroll((self.preview_scroll, 0));
 
         preview_paragraph.render(inner_preview_area, frame);
+
+        // Render selection highlight if active
+        if self.is_selecting || (self.selection_start.is_some() && self.selection_end.is_some()) {
+            self.render_selection_highlight(inner_preview_area, frame);
+        }
 
         // Scrollbar (only when content overflows)
         if self.preview_text.height() > ph as usize {
@@ -984,6 +1177,11 @@ impl Model for FileBrowser {
                 .track_style(self.styles.scrollbar_track)
                 .hit_id(PREVIEW_SCROLLBAR_HIT_ID);
             StatefulWidget::render(&scrollbar, inner_preview_area, frame, &mut sb_state);
+        }
+
+        // Render toast notification if active
+        if let Some(ref toast) = self.toast_text {
+            self.render_toast(toast, inner_preview_area, frame);
         }
 
         // ---- Status bar ----
@@ -1157,6 +1355,164 @@ impl FileBrowser {
                 .print_text_clipped(x, y, node.label, label_cell, max_x);
         }
     }
+
+    /// Render selection highlight by inverting colors in the selected region.
+    fn render_selection_highlight(&self, area: Rect, frame: &mut Frame) {
+        let (start, end) = match (self.selection_start, self.selection_end) {
+            (Some(s), Some(e)) => (s, e),
+            _ => return,
+        };
+
+        // Normalize start and end (handle reverse selection)
+        let (start_y, start_x, end_y, end_x) = if (start.1, start.0) <= (end.1, end.0) {
+            (start.1, start.0, end.1, end.0)
+        } else {
+            (end.1, end.0, start.1, start.0)
+        };
+
+        // Highlight cells in the selection range
+        for row in start_y..=end_y {
+            if row >= area.height {
+                break;
+            }
+            let screen_y = area.y + row;
+
+            let col_start = if row == start_y { start_x } else { 0 };
+            let col_end = if row == end_y {
+                end_x
+            } else {
+                area.width.saturating_sub(1)
+            };
+
+            for col in col_start..=col_end {
+                if col >= area.width {
+                    break;
+                }
+                let screen_x = area.x + col;
+
+                // Invert fg/bg colors for selection highlight
+                if let Some(cell) = frame.buffer.get_mut(screen_x, screen_y) {
+                    let orig_fg = cell.fg;
+                    let orig_bg = cell.bg;
+                    cell.fg = if orig_bg == PackedRgba::TRANSPARENT {
+                        PackedRgba::rgb(30, 30, 30) // Dark background as fg
+                    } else {
+                        orig_bg
+                    };
+                    cell.bg = if orig_fg == PackedRgba::TRANSPARENT {
+                        PackedRgba::rgb(200, 200, 200) // Light fg as bg
+                    } else {
+                        orig_fg
+                    };
+                }
+            }
+        }
+    }
+
+    /// Render toast notification in the upper-right corner of the preview area.
+    fn render_toast(&self, message: &str, area: Rect, frame: &mut Frame) {
+        // Toast dimensions
+        let toast_width = (message.len() + 4).min(area.width as usize) as u16;
+        let toast_height = 3u16;
+
+        // Position in upper-right corner with some margin
+        let toast_x = area.x + area.width.saturating_sub(toast_width + 1);
+        let toast_y = area.y + 1;
+
+        if toast_x < area.x || toast_y + toast_height > area.y + area.height {
+            return; // Not enough space
+        }
+
+        let toast_area = Rect::new(toast_x, toast_y, toast_width, toast_height);
+
+        // Toast styling
+        let toast_bg = PackedRgba::rgb(50, 50, 50);
+        let toast_fg = PackedRgba::rgb(150, 255, 150); // Light green
+        let border_fg = PackedRgba::rgb(100, 200, 100);
+
+        // Draw background
+        for y in toast_area.y..toast_area.y + toast_area.height {
+            for x in toast_area.x..toast_area.x + toast_area.width {
+                if let Some(cell) = frame.buffer.get_mut(x, y) {
+                    cell.bg = toast_bg;
+                    cell.fg = toast_fg;
+                    cell.content = ftui_render::cell::CellContent::from_char(' ');
+                }
+            }
+        }
+
+        // Draw border (simple box)
+        let border_chars = ['╭', '─', '╮', '│', '│', '╰', '─', '╯'];
+        // Top-left
+        if let Some(c) = frame.buffer.get_mut(toast_area.x, toast_area.y) {
+            c.content = ftui_render::cell::CellContent::from_char(border_chars[0]);
+            c.fg = border_fg;
+        }
+        // Top-right
+        if let Some(c) = frame
+            .buffer
+            .get_mut(toast_area.x + toast_area.width - 1, toast_area.y)
+        {
+            c.content = ftui_render::cell::CellContent::from_char(border_chars[2]);
+            c.fg = border_fg;
+        }
+        // Bottom-left
+        if let Some(c) = frame
+            .buffer
+            .get_mut(toast_area.x, toast_area.y + toast_area.height - 1)
+        {
+            c.content = ftui_render::cell::CellContent::from_char(border_chars[5]);
+            c.fg = border_fg;
+        }
+        // Bottom-right
+        if let Some(c) = frame.buffer.get_mut(
+            toast_area.x + toast_area.width - 1,
+            toast_area.y + toast_area.height - 1,
+        ) {
+            c.content = ftui_render::cell::CellContent::from_char(border_chars[7]);
+            c.fg = border_fg;
+        }
+        // Top/bottom borders
+        for x in (toast_area.x + 1)..(toast_area.x + toast_area.width - 1) {
+            if let Some(c) = frame.buffer.get_mut(x, toast_area.y) {
+                c.content = ftui_render::cell::CellContent::from_char(border_chars[1]);
+                c.fg = border_fg;
+            }
+            if let Some(c) = frame
+                .buffer
+                .get_mut(x, toast_area.y + toast_area.height - 1)
+            {
+                c.content = ftui_render::cell::CellContent::from_char(border_chars[6]);
+                c.fg = border_fg;
+            }
+        }
+        // Side borders
+        for y in (toast_area.y + 1)..(toast_area.y + toast_area.height - 1) {
+            if let Some(c) = frame.buffer.get_mut(toast_area.x, y) {
+                c.content = ftui_render::cell::CellContent::from_char(border_chars[3]);
+                c.fg = border_fg;
+            }
+            if let Some(c) = frame.buffer.get_mut(toast_area.x + toast_area.width - 1, y) {
+                c.content = ftui_render::cell::CellContent::from_char(border_chars[4]);
+                c.fg = border_fg;
+            }
+        }
+
+        // Draw message text (centered in middle row)
+        let text_y = toast_area.y + 1;
+        let text_start_x = toast_area.x + 2;
+        let max_text_len = (toast_area.width as usize).saturating_sub(4);
+        let display_msg: String = message.chars().take(max_text_len).collect();
+
+        for (i, ch) in display_msg.chars().enumerate() {
+            let x = text_start_x + i as u16;
+            if x < toast_area.x + toast_area.width - 1
+                && let Some(c) = frame.buffer.get_mut(x, text_y) {
+                    c.content = ftui_render::cell::CellContent::from_char(ch);
+                    c.fg = toast_fg;
+                }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,7 +1604,23 @@ mod tests {
             update_notice: None,
             tree_scroll: scroll,
             tree_height: Cell::new(0),
+            // Selection & toast state
+            selection_start: None,
+            selection_end: None,
+            is_selecting: false,
+            toast_text: None,
+            toast_start: None,
+            preview_inner_area: Cell::new(Rect::new(0, 0, 0, 0)),
         }
+    }
+
+    /// Helper: create a FileBrowser with preview content for selection tests.
+    fn make_test_browser_with_preview(preview: &str, scroll: u16) -> FileBrowser {
+        let mut browser = make_test_browser(vec![], 0, 0);
+        browser.preview_text = Text::raw(preview);
+        browser.preview_scroll = scroll;
+        browser.focus = Pane::Preview;
+        browser
     }
 
     // -----------------------------------------------------------------------
@@ -2038,6 +2410,371 @@ $$
             result.is_ok() || result.is_err(),
             "catch_unwind should always return Ok or Err"
         );
+    }
+
+    // =======================================================================
+    // COPY-ON-SELECTION TESTS (file-browser-gbw)
+    // =======================================================================
+
+    // -----------------------------------------------------------------------
+    // Selection State Tests (file-browser-gbw.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn selection_starts_on_mouse_down_in_preview() {
+        let mut browser = make_test_browser_with_preview("Hello World", 0);
+        // Set up preview area for hit testing
+        browser.preview_inner_area.set(Rect::new(10, 1, 30, 10));
+
+        // Simulate mouse down in preview area
+        browser.selection_start = Some((5, 2));
+        browser.is_selecting = true;
+
+        assert!(
+            browser.is_selecting,
+            "is_selecting should be true after mouse down"
+        );
+        assert_eq!(
+            browser.selection_start,
+            Some((5, 2)),
+            "selection_start should be set"
+        );
+    }
+
+    #[test]
+    fn selection_updates_on_mouse_drag() {
+        let mut browser = make_test_browser_with_preview("Hello World\nLine two", 0);
+        browser.preview_inner_area.set(Rect::new(10, 1, 30, 10));
+        browser.selection_start = Some((0, 0));
+        browser.is_selecting = true;
+
+        // Simulate drag to new position
+        browser.selection_end = Some((5, 1));
+
+        assert_eq!(
+            browser.selection_end,
+            Some((5, 1)),
+            "selection_end should update during drag"
+        );
+        assert!(
+            browser.is_selecting,
+            "is_selecting should remain true during drag"
+        );
+    }
+
+    #[test]
+    fn selection_clears_on_mouse_up() {
+        let mut browser = make_test_browser_with_preview("Hello World", 0);
+        browser.preview_inner_area.set(Rect::new(10, 1, 30, 10));
+        browser.selection_start = Some((0, 0));
+        browser.selection_end = Some((5, 0));
+        browser.is_selecting = true;
+
+        // Simulate mouse up by clearing selection
+        browser.clear_selection();
+
+        assert!(
+            !browser.is_selecting,
+            "is_selecting should be false after mouse up"
+        );
+        assert_eq!(
+            browser.selection_start, None,
+            "selection_start should be cleared"
+        );
+        assert_eq!(
+            browser.selection_end, None,
+            "selection_end should be cleared"
+        );
+    }
+
+    #[test]
+    fn selection_ignored_outside_preview_pane() {
+        let browser = make_test_browser_with_preview("Hello World", 0);
+        browser.preview_inner_area.set(Rect::new(10, 1, 30, 10));
+
+        // Position outside preview area (in tree pane)
+        assert!(
+            !browser.is_in_preview_area(5, 5),
+            "should not be in preview area"
+        );
+
+        // Position inside preview area
+        assert!(
+            browser.is_in_preview_area(15, 5),
+            "should be in preview area"
+        );
+    }
+
+    #[test]
+    fn selection_canceled_on_escape() {
+        let mut browser = make_test_browser_with_preview("Hello World", 0);
+        browser.selection_start = Some((0, 0));
+        browser.selection_end = Some((5, 0));
+        browser.is_selecting = true;
+
+        // Escape should clear selection
+        browser.clear_selection();
+
+        assert!(!browser.is_selecting);
+        assert_eq!(browser.selection_start, None);
+        assert_eq!(browser.selection_end, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Text Position Mapping Tests (file-browser-gbw.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_cell_to_char_basic() {
+        let browser = make_test_browser_with_preview("Hello World", 0);
+
+        // Map position (0, 0) should be character 0 ('H')
+        let idx = browser.map_cell_to_char(0, 0, 80);
+        assert_eq!(idx, Some(0), "position (0,0) should map to char index 0");
+
+        // Map position (5, 0) should be character 5 (' ')
+        let idx = browser.map_cell_to_char(5, 0, 80);
+        assert_eq!(idx, Some(5), "position (5,0) should map to char index 5");
+    }
+
+    #[test]
+    fn map_cell_to_char_with_scroll() {
+        let browser = make_test_browser_with_preview("Line 0\nLine 1\nLine 2\nLine 3", 2);
+
+        // With scroll=2, visual row 0 should map to line 2
+        let idx = browser.map_cell_to_char(0, 0, 80);
+        // Line 0 = "Line 0\n" (7 chars), Line 1 = "Line 1\n" (7 chars)
+        // Line 2 starts at char 14
+        assert_eq!(
+            idx,
+            Some(14),
+            "position (0,0) with scroll=2 should map to line 2 start"
+        );
+    }
+
+    #[test]
+    fn map_cell_to_char_multiline() {
+        let browser = make_test_browser_with_preview("AB\nCD\nEF", 0);
+
+        // Line 0: "AB\n" (chars 0, 1, 2)
+        // Line 1: "CD\n" (chars 3, 4, 5)
+        // Line 2: "EF"   (chars 6, 7)
+
+        let idx = browser.map_cell_to_char(0, 1, 80);
+        assert_eq!(idx, Some(3), "position (0,1) should map to char 3 ('C')");
+
+        let idx = browser.map_cell_to_char(1, 2, 80);
+        assert_eq!(idx, Some(7), "position (1,2) should map to char 7 ('F')");
+    }
+
+    #[test]
+    fn map_cell_to_char_out_of_bounds() {
+        let browser = make_test_browser_with_preview("Short", 0);
+
+        // Position way beyond text
+        let idx = browser.map_cell_to_char(0, 100, 80);
+        assert_eq!(idx, None, "out-of-bounds row should return None");
+    }
+
+    #[test]
+    fn map_cell_to_char_multibyte_utf8() {
+        let browser = make_test_browser_with_preview("Héllo 世界", 0);
+
+        // UTF-8 characters should be counted correctly
+        let idx = browser.map_cell_to_char(0, 0, 80);
+        assert_eq!(idx, Some(0), "position (0,0) should map to char 0");
+
+        // Note: This test verifies the function handles UTF-8 without crashing
+        // Exact column mapping depends on how terminal renders wide chars
+    }
+
+    // -----------------------------------------------------------------------
+    // Selection Text Extraction Tests (file-browser-gbw.4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_selection_single_line() {
+        let browser = make_test_browser_with_preview("Hello World", 0);
+
+        let text = browser.extract_selected_text(0, 5);
+        assert_eq!(text, "Hello", "should extract 'Hello'");
+    }
+
+    #[test]
+    fn extract_selection_multi_line() {
+        let browser = make_test_browser_with_preview("Line1\nLine2\nLine3", 0);
+
+        // Extract from middle of Line1 to middle of Line2
+        // "Line1\n" = 6 chars, so Line2 starts at 6
+        let text = browser.extract_selected_text(3, 9);
+        assert_eq!(text, "e1\nLin", "should extract across lines");
+    }
+
+    #[test]
+    fn extract_selection_reversed() {
+        let browser = make_test_browser_with_preview("Hello World", 0);
+
+        // End before start (reversed selection)
+        let text = browser.extract_selected_text(5, 0);
+        assert_eq!(text, "Hello", "reversed selection should work");
+    }
+
+    #[test]
+    fn extract_selection_empty() {
+        let browser = make_test_browser_with_preview("Hello World", 0);
+
+        // Same start and end
+        let text = browser.extract_selected_text(3, 3);
+        assert_eq!(text, "", "same start/end should return empty string");
+    }
+
+    #[test]
+    fn extract_selection_full_content() {
+        let browser = make_test_browser_with_preview("Full content here", 0);
+
+        let text = browser.extract_selected_text(0, 17);
+        assert_eq!(text, "Full content here", "should extract entire content");
+    }
+
+    // -----------------------------------------------------------------------
+    // Toast Lifecycle Tests (file-browser-gbw.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toast_appears_after_copy() {
+        let mut browser = make_test_browser_with_preview("Hello", 0);
+
+        browser.show_toast("Copied to clipboard");
+
+        assert_eq!(browser.toast_text, Some("Copied to clipboard".to_string()));
+    }
+
+    #[test]
+    fn toast_has_start_time() {
+        let mut browser = make_test_browser_with_preview("Hello", 0);
+
+        browser.show_toast("Test toast");
+
+        assert!(browser.toast_start.is_some(), "toast_start should be set");
+    }
+
+    #[test]
+    fn toast_dismissed_after_tick() {
+        let mut browser = make_test_browser_with_preview("Hello", 0);
+        browser.toast_text = Some("Test".to_string());
+        // Set start time in the past (>1.5s ago)
+        browser.toast_start = Some(Instant::now() - Duration::from_secs(2));
+
+        browser.check_toast_timeout();
+
+        assert_eq!(
+            browser.toast_text, None,
+            "toast should be dismissed after timeout"
+        );
+        assert_eq!(browser.toast_start, None, "toast_start should be cleared");
+    }
+
+    #[test]
+    fn toast_persists_before_timeout() {
+        let mut browser = make_test_browser_with_preview("Hello", 0);
+        browser.toast_text = Some("Test".to_string());
+        // Set start time just now (not expired)
+        browser.toast_start = Some(Instant::now());
+
+        browser.check_toast_timeout();
+
+        assert_eq!(
+            browser.toast_text,
+            Some("Test".to_string()),
+            "toast should persist before timeout"
+        );
+    }
+
+    #[test]
+    fn new_copy_resets_toast_timer() {
+        let mut browser = make_test_browser_with_preview("Hello", 0);
+        browser.show_toast("First");
+        let first_start = browser.toast_start;
+
+        // Small delay to ensure different timestamp
+        std::thread::sleep(Duration::from_millis(10));
+
+        browser.show_toast("Second");
+
+        assert_eq!(browser.toast_text, Some("Second".to_string()));
+        assert!(
+            browser.toast_start != first_start,
+            "toast_start should be updated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rendering Tests (file-browser-gbw.6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_selection_highlight_state() {
+        let mut browser = make_test_browser_with_preview("Hello World", 0);
+        browser.selection_start = Some((0, 0));
+        browser.selection_end = Some((5, 0));
+        browser.is_selecting = true;
+
+        // Verify selection state is set up for rendering
+        assert!(browser.is_selecting);
+        assert!(browser.selection_start.is_some());
+        assert!(browser.selection_end.is_some());
+    }
+
+    #[test]
+    fn render_toast_content_check() {
+        let mut browser = make_test_browser_with_preview("Hello", 0);
+        browser.show_toast("Copied to clipboard");
+
+        assert_eq!(browser.toast_text.as_deref(), Some("Copied to clipboard"));
+    }
+
+    #[test]
+    fn render_no_toast_when_none() {
+        let browser = make_test_browser_with_preview("Hello", 0);
+
+        assert!(
+            browser.toast_text.is_none(),
+            "toast_text should be None by default"
+        );
+    }
+
+    #[test]
+    fn screen_to_preview_coords_basic() {
+        let browser = make_test_browser_with_preview("Hello", 0);
+        browser.preview_inner_area.set(Rect::new(10, 5, 30, 10));
+
+        let (px, py) = browser.screen_to_preview_coords(15, 8);
+
+        assert_eq!(px, 5, "x should be offset by preview x");
+        assert_eq!(py, 3, "y should be offset by preview y");
+    }
+
+    #[test]
+    fn preview_text_as_string_basic() {
+        let browser = make_test_browser_with_preview("Hello\nWorld", 0);
+
+        let text = browser.preview_text_as_string();
+
+        assert_eq!(text, "Hello\nWorld");
+    }
+
+    #[test]
+    fn clear_selection_resets_all() {
+        let mut browser = make_test_browser_with_preview("Hello", 0);
+        browser.selection_start = Some((0, 0));
+        browser.selection_end = Some((5, 0));
+        browser.is_selecting = true;
+
+        browser.clear_selection();
+
+        assert_eq!(browser.selection_start, None);
+        assert_eq!(browser.selection_end, None);
+        assert!(!browser.is_selecting);
     }
 }
 

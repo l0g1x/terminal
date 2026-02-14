@@ -18,3 +18,4 @@ ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
 ftui-widgets = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
 ftui-extras = { git = "https://github.com/Dicklesworthstone/frankentui.git", features = ["markdown", "syntax"] }
 ftui-harness = { git = "https://github.com/Dicklesworthstone/frankentui.git" }
+arboard = "3"
