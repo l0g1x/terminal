@@ -892,7 +892,7 @@ impl FileBrowser {
                     self.clear_selection();
                     return;
                 }
-                // Copy to clipboard using arboard
+                // Try arboard first (works with display server)
                 match arboard::Clipboard::new() {
                     Ok(mut clipboard) => {
                         if clipboard.set_text(&text).is_ok() {
@@ -902,8 +902,9 @@ impl FileBrowser {
                         }
                     }
                     Err(_) => {
-                        // Clipboard not available - common in terminal without display
-                        self.show_toast("Clipboard unavailable");
+                        // Fallback to OSC 52 for terminal clipboard (works over SSH)
+                        self.copy_via_osc52(&text);
+                        self.show_toast("Copied to clipboard");
                     }
                 }
             }
@@ -915,6 +916,49 @@ impl FileBrowser {
 
         self.clear_selection();
     }
+
+    /// Copy text to clipboard via OSC 52 escape sequence.
+    /// Works in terminals that support it (iTerm2, kitty, alacritty, etc.)
+    /// even over SSH without X forwarding.
+    fn copy_via_osc52(&self, text: &str) {
+        use std::io::Write;
+        let encoded = base64_encode(text.as_bytes());
+        // OSC 52 format: ESC ] 52 ; c ; <base64> BEL
+        // c = clipboard, p = primary selection
+        let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+        // Write directly to stdout (terminal)
+        let _ = std::io::stdout().write_all(osc52.as_bytes());
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Simple base64 encoder (avoids adding a dependency).
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        
+        result.push(ALPHABET[b0 >> 2] as char);
+        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+        
+        if chunk.len() > 2 {
+            result.push(ALPHABET[b2 & 0x3f] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    
+    result
 }
 
 impl Model for FileBrowser {
@@ -2802,6 +2846,23 @@ $$
         assert_eq!(browser.selection_start, None);
         assert_eq!(browser.selection_end, None);
         assert!(!browser.is_selecting);
+    }
+
+    #[test]
+    fn base64_encode_basic() {
+        // Test vectors from RFC 4648
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_encode_hello_world() {
+        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
     }
 }
 
