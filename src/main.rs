@@ -230,6 +230,8 @@ struct FileBrowser {
     toast_start: Option<Instant>,
     /// Cached preview inner area for hit-testing mouse events.
     preview_inner_area: Cell<Rect>,
+    /// Last time a tree scroll was handled (for debouncing rapid scroll events).
+    last_tree_scroll: Cell<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,7 +602,23 @@ impl FileBrowser {
             toast_text: None,
             toast_start: None,
             preview_inner_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_tree_scroll: Cell::new(None),
         }
+    }
+
+    /// Check if enough time has passed since last scroll (debounce).
+    /// Returns true if we should handle this scroll event.
+    fn should_handle_scroll(&self) -> bool {
+        const SCROLL_DEBOUNCE_MS: u64 = 50; // Ignore scrolls within 50ms of each other
+        
+        let now = Instant::now();
+        if let Some(last) = self.last_tree_scroll.get() {
+            if now.duration_since(last) < Duration::from_millis(SCROLL_DEBOUNCE_MS) {
+                return false;
+            }
+        }
+        self.last_tree_scroll.set(Some(now));
+        true
     }
 
     /// Resolve the filesystem path for the current selected_index, using cache.
@@ -1123,17 +1141,23 @@ impl Model for FileBrowser {
                 MouseEventKind::ScrollUp => {
                     // Scroll based on mouse position, not focus
                     if self.is_in_preview_area(me.x, me.y) {
-                        self.scroll_preview_up(3);
+                        self.scroll_preview_up(1);
                     } else {
-                        self.move_selection_by(-1);
+                        // Debounce: only scroll if enough time has passed
+                        if self.should_handle_scroll() {
+                            self.move_selection_by(-1);
+                        }
                     }
                 }
                 MouseEventKind::ScrollDown => {
                     // Scroll based on mouse position, not focus
                     if self.is_in_preview_area(me.x, me.y) {
-                        self.scroll_preview_down(3);
+                        self.scroll_preview_down(1);
                     } else {
-                        self.move_selection_by(1);
+                        // Debounce: only scroll if enough time has passed
+                        if self.should_handle_scroll() {
+                            self.move_selection_by(1);
+                        }
                     }
                 }
                 _ => {}
@@ -1684,6 +1708,7 @@ mod tests {
             toast_text: None,
             toast_start: None,
             preview_inner_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_tree_scroll: Cell::new(None),
         }
     }
 
@@ -2865,6 +2890,182 @@ $$
     #[test]
     fn base64_encode_hello_world() {
         assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mouse Scroll Integration Tests
+    // -----------------------------------------------------------------------
+
+    /// Helper to create a mouse scroll event
+    fn make_scroll_event(kind: MouseEventKind, x: u16, y: u16) -> Msg {
+        Msg::Mouse(MouseEvent {
+            kind,
+            x,
+            y,
+            modifiers: ftui_core::event::Modifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn scroll_down_in_tree_moves_selection_by_one() {
+        // Create browser with multiple files
+        let mut browser = make_test_browser(
+            vec![
+                TreeNode::new("file1.txt"),
+                TreeNode::new("file2.txt"),
+                TreeNode::new("file3.txt"),
+                TreeNode::new("file4.txt"),
+                TreeNode::new("file5.txt"),
+            ],
+            0, // Start at root
+            0,
+        );
+        browser.visible_count = 6; // root + 5 files
+        
+        // Start at index 1 (first file after root)
+        browser.selected_index = 1;
+        let initial_index = browser.selected_index;
+
+        // Simulate ONE scroll down event in tree area (x=5, y=5 - not in preview)
+        // Preview area not set, so is_in_preview_area will return false
+        browser.preview_inner_area.set(Rect::new(50, 0, 30, 20));
+        
+        let scroll_msg = make_scroll_event(MouseEventKind::ScrollDown, 5, 5);
+        browser.update(scroll_msg);
+
+        assert_eq!(
+            browser.selected_index,
+            initial_index + 1,
+            "One scroll down should move selection by exactly 1"
+        );
+    }
+
+    #[test]
+    fn scroll_up_in_tree_moves_selection_by_one() {
+        let mut browser = make_test_browser(
+            vec![
+                TreeNode::new("file1.txt"),
+                TreeNode::new("file2.txt"),
+                TreeNode::new("file3.txt"),
+            ],
+            0,
+            0,
+        );
+        browser.visible_count = 4;
+        
+        // Start at index 3 (last file)
+        browser.selected_index = 3;
+        let initial_index = browser.selected_index;
+
+        browser.preview_inner_area.set(Rect::new(50, 0, 30, 20));
+        
+        let scroll_msg = make_scroll_event(MouseEventKind::ScrollUp, 5, 5);
+        browser.update(scroll_msg);
+
+        assert_eq!(
+            browser.selected_index,
+            initial_index - 1,
+            "One scroll up should move selection by exactly 1"
+        );
+    }
+
+    #[test]
+    fn rapid_scroll_events_are_debounced() {
+        let mut browser = make_test_browser(
+            vec![
+                TreeNode::new("file1.txt"),
+                TreeNode::new("file2.txt"),
+                TreeNode::new("file3.txt"),
+                TreeNode::new("file4.txt"),
+                TreeNode::new("file5.txt"),
+            ],
+            0,
+            0,
+        );
+        browser.visible_count = 6;
+        browser.selected_index = 1;
+        let initial_index = browser.selected_index;
+
+        browser.preview_inner_area.set(Rect::new(50, 0, 30, 20));
+        
+        // Simulate THREE rapid scroll down events (within debounce window)
+        for _ in 0..3 {
+            let scroll_msg = make_scroll_event(MouseEventKind::ScrollDown, 5, 5);
+            browser.update(scroll_msg);
+        }
+
+        // Due to debouncing, only the first event should be processed
+        assert_eq!(
+            browser.selected_index,
+            initial_index + 1,
+            "Rapid scroll events should be debounced to move by 1"
+        );
+    }
+
+    #[test]
+    fn scroll_events_with_delay_are_not_debounced() {
+        let mut browser = make_test_browser(
+            vec![
+                TreeNode::new("file1.txt"),
+                TreeNode::new("file2.txt"),
+                TreeNode::new("file3.txt"),
+                TreeNode::new("file4.txt"),
+                TreeNode::new("file5.txt"),
+            ],
+            0,
+            0,
+        );
+        browser.visible_count = 6;
+        browser.selected_index = 1;
+        let initial_index = browser.selected_index;
+
+        browser.preview_inner_area.set(Rect::new(50, 0, 30, 20));
+        
+        // Simulate scroll events with delay between them
+        for _ in 0..3 {
+            let scroll_msg = make_scroll_event(MouseEventKind::ScrollDown, 5, 5);
+            browser.update(scroll_msg);
+            // Sleep longer than debounce window (50ms)
+            std::thread::sleep(Duration::from_millis(60));
+        }
+
+        // With delay, all events should be processed
+        assert_eq!(
+            browser.selected_index,
+            initial_index + 3,
+            "Scroll events with delay should all be processed"
+        );
+    }
+
+    #[test]
+    fn scroll_in_preview_area_does_not_change_selection() {
+        let mut browser = make_test_browser(
+            vec![TreeNode::new("file1.txt")],
+            0,
+            0,
+        );
+        browser.visible_count = 2;
+        browser.selected_index = 1;
+        browser.preview_text = Text::raw("Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
+        
+        // Set preview area so scroll is detected as being inside it
+        browser.preview_inner_area.set(Rect::new(10, 0, 30, 20));
+        
+        let initial_index = browser.selected_index;
+        let initial_scroll = browser.preview_scroll;
+
+        // Scroll inside preview area
+        let scroll_msg = make_scroll_event(MouseEventKind::ScrollDown, 15, 5);
+        browser.update(scroll_msg);
+
+        assert_eq!(
+            browser.selected_index, initial_index,
+            "Scroll in preview should not change tree selection"
+        );
+        assert!(
+            browser.preview_scroll > initial_scroll || browser.preview_scroll == initial_scroll,
+            "Scroll in preview should scroll preview content"
+        );
     }
 }
 
