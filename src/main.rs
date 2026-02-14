@@ -868,21 +868,48 @@ impl FileBrowser {
     fn copy_selection_to_clipboard(&mut self) {
         let (start, end) = match (self.selection_start, self.selection_end) {
             (Some(s), Some(e)) => (s, e),
-            _ => return,
+            _ => {
+                self.clear_selection();
+                return;
+            }
         };
 
-        let wrap_width = self.preview_inner_area.get().width;
+        // Skip if start and end are the same (no selection)
+        if start == end {
+            self.clear_selection();
+            return;
+        }
+
+        let wrap_width = self.preview_inner_area.get().width.max(1);
         let start_idx = self.map_cell_to_char(start.0, start.1, wrap_width);
         let end_idx = self.map_cell_to_char(end.0, end.1, wrap_width);
 
-        if let (Some(si), Some(ei)) = (start_idx, end_idx) {
-            let text = self.extract_selected_text(si, ei);
-            if !text.is_empty() {
+        match (start_idx, end_idx) {
+            (Some(si), Some(ei)) => {
+                let text = self.extract_selected_text(si, ei);
+                if text.is_empty() {
+                    // No text selected (clicked without dragging)
+                    self.clear_selection();
+                    return;
+                }
                 // Copy to clipboard using arboard
-                if let Ok(mut clipboard) = arboard::Clipboard::new()
-                    && clipboard.set_text(&text).is_ok() {
-                        self.show_toast("Copied to clipboard");
+                match arboard::Clipboard::new() {
+                    Ok(mut clipboard) => {
+                        if clipboard.set_text(&text).is_ok() {
+                            self.show_toast("Copied to clipboard");
+                        } else {
+                            self.show_toast("Clipboard write failed");
+                        }
                     }
+                    Err(_) => {
+                        // Clipboard not available - common in terminal without display
+                        self.show_toast("Clipboard unavailable");
+                    }
+                }
+            }
+            _ => {
+                // Could not map cell positions to character indices
+                // This can happen with empty preview or positioning issues
             }
         }
 
