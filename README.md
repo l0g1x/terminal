@@ -2,7 +2,8 @@
 
 A terminal file browser built with [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) featuring mouse support and markdown rendering.
 
-![terminal screenshot](assets/screenshot.png)
+<img width="1799" height="1071" alt="image" src="https://github.com/user-attachments/assets/d1ad43b3-fa5b-419e-a0d1-a8ef8fbf75e6" />
+
 
 ## Install
 
