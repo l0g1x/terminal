@@ -232,6 +232,10 @@ struct FileBrowser {
     preview_inner_area: Cell<Rect>,
     /// Last time a tree scroll was handled (for debouncing rapid scroll events).
     last_tree_scroll: Cell<Option<Instant>>,
+    /// Cached total visual line count (after word-wrap) for the preview pane.
+    preview_wrapped_height: Cell<u16>,
+    /// Viewport width at which `preview_wrapped_height` was computed.
+    preview_wrap_width: Cell<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,6 +607,8 @@ impl FileBrowser {
             toast_start: None,
             preview_inner_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_tree_scroll: Cell::new(None),
+            preview_wrapped_height: Cell::new(0),
+            preview_wrap_width: Cell::new(0),
         }
     }
 
@@ -687,8 +693,10 @@ impl FileBrowser {
 
         self.selected_file = Some(path);
         self.preview_scroll = 0;
-        let total = self.preview_text.height();
-        self.scrollbar_state = ScrollbarState::new(total, 0, self.preview_height.get() as usize);
+        // Invalidate wrapped-height cache so it is recomputed on next frame.
+        self.preview_wrap_width.set(0);
+        self.preview_wrapped_height.set(0);
+        self.scrollbar_state = ScrollbarState::new(0, 0, self.preview_height.get() as usize);
     }
 
     /// Keep `tree_scroll` in sync so `selected_index` is always visible.
@@ -759,6 +767,30 @@ impl FileBrowser {
         }
     }
 
+    /// Compute total visual (wrapped) line count for the preview text at the
+    /// given viewport width.  Results are cached and only recomputed when the
+    /// width changes.
+    fn wrapped_preview_height(&self, viewport_width: u16) -> u16 {
+        if viewport_width == self.preview_wrap_width.get()
+            && self.preview_wrapped_height.get() > 0
+        {
+            return self.preview_wrapped_height.get();
+        }
+        let w = viewport_width as usize;
+        let mut count: u16 = 0;
+        for line in self.preview_text.lines() {
+            if w > 0 && line.width() > w {
+                let wrapped = line.wrap(w, WrapMode::Word);
+                count = count.saturating_add(wrapped.len() as u16);
+            } else {
+                count = count.saturating_add(1);
+            }
+        }
+        self.preview_wrap_width.set(viewport_width);
+        self.preview_wrapped_height.set(count);
+        count
+    }
+
     /// Scroll preview up.
     fn scroll_preview_up(&mut self, lines: u16) {
         self.preview_scroll = self.preview_scroll.saturating_sub(lines);
@@ -767,7 +799,8 @@ impl FileBrowser {
 
     /// Scroll preview down.
     fn scroll_preview_down(&mut self, lines: u16) {
-        let max = (self.preview_text.height() as u16).saturating_sub(self.preview_height.get() / 2);
+        let total = self.wrapped_preview_height(self.preview_inner_area.get().width);
+        let max = total.saturating_sub(self.preview_height.get());
         self.preview_scroll = self.preview_scroll.saturating_add(lines).min(max);
         self.scrollbar_state.position = self.preview_scroll as usize;
     }
@@ -1047,8 +1080,10 @@ impl Model for FileBrowser {
                         self.update_tree_scroll();
                         self.on_selection_changed();
                     } else {
-                        let max = (self.preview_text.height() as u16)
-                            .saturating_sub(self.preview_height.get() / 2);
+                        let total = self.wrapped_preview_height(
+                            self.preview_inner_area.get().width,
+                        );
+                        let max = total.saturating_sub(self.preview_height.get());
                         self.preview_scroll = max;
                         self.scrollbar_state.position = max as usize;
                     }
@@ -1263,9 +1298,10 @@ impl Model for FileBrowser {
         }
 
         // Scrollbar (only when content overflows)
-        if self.preview_text.height() > ph as usize {
+        let wrapped_h = self.wrapped_preview_height(inner_preview_area.width);
+        if wrapped_h > ph {
             let mut sb_state = ScrollbarState::new(
-                self.preview_text.height(),
+                wrapped_h as usize,
                 self.preview_scroll as usize,
                 ph as usize,
             );
@@ -1709,6 +1745,8 @@ mod tests {
             toast_start: None,
             preview_inner_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_tree_scroll: Cell::new(None),
+            preview_wrapped_height: Cell::new(0),
+            preview_wrap_width: Cell::new(0),
         }
     }
 
